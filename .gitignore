@@ -1,0 +1,5 @@
+node_modules/
+output.txt
+playtime.txt
+src/tokens.db
+accounts.txt

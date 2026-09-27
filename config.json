@@ -1,0 +1,9 @@
+{
+    "playingGames": [730],
+    "onlinestatus": 1,
+    "afkMessage": "",
+    "loginDelay": 2000,
+    "relogDelay": 15000,
+    "useLocalIP": true,
+    "logPlaytimeToFile": true
+}
