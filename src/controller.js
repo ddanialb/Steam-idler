@@ -116,6 +116,17 @@ function importProxies() {
     return new Promise((resolve) => {
         let proxies = []; // When the file is just created there can't be proxies in it (this bot doesn't support magic)
 
+        // RENDER: PROXY env var has priority (http proxies, separated by commas, e.g. http://user:pass@host:port)
+        if (process.env.PROXY && process.env.PROXY.trim().length > 0) {
+            proxies = process.env.PROXY.split(",").map(e => e.trim()).filter(e => e.length > 0);
+
+            logger("info", `Loaded ${proxies.length} proxies from PROXY env var!`);
+
+            if (config.useLocalIP) proxies.unshift(null); // Add no proxy (local ip) if useLocalIP is true
+
+            return resolve(proxies);
+        }
+
         if (!fs.existsSync("./proxies.txt")) {
             resolve([ null ]);
         } else { // File does seem to exist so now we can try and read it
