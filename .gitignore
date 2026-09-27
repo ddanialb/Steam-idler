@@ -3,3 +3,4 @@ output.txt
 playtime.txt
 src/tokens.db
 accounts.txt
+state.json

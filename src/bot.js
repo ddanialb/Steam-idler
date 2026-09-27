@@ -216,6 +216,15 @@ Bot.prototype.attachEventListeners = function() {
 
         } else { // Connection loss
 
+            // RENDER: Another session using this account is online somewhere else (local PC, second Render service...)
+            // Back off hard (10 minutes) instead of ping-pong kicking each other every few seconds!
+            if (err.eresult == SteamUser.EResult.LoggedInElsewhere) {
+                logger("warn", `[${this.logOnOptions.accountName}] LoggedInElsewhere: This account is logged in somewhere else too (is the idler still running on your PC?). Slowing down relog attempts to every 10 minutes to avoid a login fight...`);
+
+                this.handleRelog(600000);
+                return;
+            }
+
             // If error occurred during relog (aka logOn gave up because connection is still down), move account to the back of the queue and call handleRelog again
             if (controller.relogQueue.includes(this.loginindex)) {
                 logger("warn", `[${this.logOnOptions.accountName}] Failed to relog. Repositioning to the back of the queue and trying again. ${err}`);
@@ -240,8 +249,9 @@ Bot.prototype.attachEventListeners = function() {
 
 /**
  * Handles relogging this bot account
+ * @param {number} [customRelogDelay] Optional delay override in ms (used for LoggedInElsewhere backoff)
  */
-Bot.prototype.handleRelog = function() {
+Bot.prototype.handleRelog = function(customRelogDelay) {
     if (controller.relogQueue.includes(this.loginindex)) return; // Don't handle this request if account is already waiting for relog
 
     // Call logPlaytime to print session results and reset startedPlayingTimestamp
@@ -275,7 +285,7 @@ Bot.prototype.handleRelog = function() {
                 this.client.logOn({ "refreshToken": refreshToken });
             }, config.loginDelay);
         }, 1000);
-    }, config.relogDelay);
+    }, customRelogDelay ? customRelogDelay : config.relogDelay);
 };
 
 
