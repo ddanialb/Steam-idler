@@ -30,8 +30,9 @@ const controller = require("./src/controller.js");
 controller.start();
 
 
-// --- RENDER: tiny status page (health check + live overview, nothing sensitive shown) ---
+// --- RENDER: tiny status page (health check + live overview + QR login, nothing sensitive shown) ---
 const http      = require("http");
+const QRCode    = require("qrcode");
 const startedAt = Date.now();
 const PORT      = process.env.PORT || 3000;
 
@@ -52,14 +53,15 @@ const fmtDur = (ms) => {
 const GAME_NAMES = { "730": "CS2", "440": "TF2", "570": "Dota 2", "10": "CS 1.6", "252490": "Rust" };
 const gameName = (g) => (typeof g === "number" && GAME_NAMES[g] ? `${GAME_NAMES[g]} (${g})` : esc(g));
 
-function renderPage() {
+async function renderPage() {
     const bots   = controller.allBots || [];
     const uptime = fmtDur(Date.now() - startedAt);
     const games  = config.playingGames.map(gameName).join("، ") || "-";
+    const qr     = global.renderQrChallenge || null;
 
     let rows = "";
 
-    if (bots.length == 0) {
+    if (bots.length == 0 && !qr) {
         rows = `<tr><td colspan="3" class="empty">⏳ در حال راه‌اندازی... اگه این پیام موند، یعنی env مربوط به ACCOUNTS درست تنظیم نشده.</td></tr>`;
     } else {
         for (const b of bots) {
@@ -69,6 +71,8 @@ function renderPage() {
                 status = "🎮 در حال فارم"; css = "ok";
             } else if (b.client.steamID) {
                 status = "✅ آنلاین"; css = "wait";
+            } else if (qr && qr.accountName == b.logOnOptions.accountName) {
+                status = "📱 منتظر اسکن QR"; css = "wait";
             } else {
                 status = "⏳ در حال اتصال"; css = "wait";
             }
@@ -79,12 +83,31 @@ function renderPage() {
         }
     }
 
+    // If a QR login is pending, render the challenge as a scannable QR code image
+    let qrBlock = "";
+
+    if (qr) {
+        try {
+            const qrImg = await QRCode.toDataURL(qr.url, { scale: 9, margin: 2, color: { dark: "#0b1120", light: "#ffffff" } });
+
+            qrBlock = `
+    <div class="qrbox">
+      <h2>🔐 تأیید ورود لازمه!</h2>
+      <p>اپ <b>Steam</b> رو باز کن ← <b>Steam Guard</b> (🛡️) ← دوربین/اسکنر ← این کد رو اسکن کن:</p>
+      <img src="${qrImg}" width="250" height="250" alt="Steam QR Code">
+      <p class="small">برای اکانت: <b>${mask(qr.accountName)}</b> — کد محدوده، اگه expire شد همین صفحه رو رفرش کن 🔄</p>
+    </div>`;
+        } catch (err) {
+            qrBlock = `<div class="qrbox"><h2>⚠️ خطا در ساخت QR</h2><p>${esc(err.message)}</p></div>`;
+        }
+    }
+
     return `<!DOCTYPE html>
 <html dir="rtl" lang="fa">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
+<meta http-equiv="refresh" content="${qr ? 8 : 30}">
 <title>🎮 Steam Idler</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -102,12 +125,20 @@ function renderPage() {
   .chip.ok { background: rgba(74,222,128,.15); color: #4ade80; }
   .chip.wait { background: rgba(250,204,21,.15); color: #facc15; }
   .hint { margin-top: 14px; font-size: 11px; color: #64748b; text-align: center; }
+  .qrbox { background: #0f172a; border: 1px solid #7dd3fc; border-radius: 10px; padding: 18px; margin-bottom: 16px; text-align: center; }
+  .qrbox h2 { font-size: 17px; color: #7dd3fc; margin-bottom: 10px; }
+  .qrbox p { font-size: 13px; color: #cbd5e1; margin: 8px 0; }
+  .qrbox img { border-radius: 10px; margin: 10px auto; display: block; }
+  .qrbox .small { font-size: 11px; color: #64748b; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  .qrbox h2 { animation: pulse 1.6s infinite; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>🎮 Steam Idler</h1>
     <p class="sub">ساعت‌زنی خودکار استیم روی Render</p>
+    ${qrBlock}
     <div class="stats">
       <div>⏱ آپتایم سرویس: <b>${uptime}</b></div>
       <div>🎯 بازی‌های در صف فارم: <b>${games}</b></div>
@@ -123,8 +154,15 @@ function renderPage() {
 }
 
 http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(renderPage());
+    renderPage()
+        .then((html) => {
+            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+            res.end(html);
+        })
+        .catch((err) => {
+            res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("Error rendering status page: " + err.message);
+        });
 }).listen(PORT, () => {
     console.log(`Status page listening on port ${PORT}`);
 });

@@ -120,6 +120,13 @@ sessionHandler.prototype._acceptSteamGuardCode = function(code) {
  */
 sessionHandler.prototype._handleQRCode = function(res) {
 
+    // RENDER: expose the QR challenge so the status page in idler.js can display it in the browser
+    global.renderQrChallenge = {
+        accountName: this.logOnOptions.accountName,
+        url: res.qrChallengeUrl,
+        requestedAt: Date.now()
+    };
+
     // Display QR Code using qrcode library
     qrcode.toString(res.qrChallengeUrl, (err, string) => {
         if (err) {

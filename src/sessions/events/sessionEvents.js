@@ -21,6 +21,8 @@ const sessionHandler = require("../sessionHandler.js");
 sessionHandler.prototype._attachEvents = function() {
 
     this.session.on("authenticated", () => { // Success
+        global.renderQrChallenge = null; // RENDER: QR was scanned & approved, remove it from the status page
+
         logger.stopReadInput("Login request accepted"); // Should the user have approved this login attempt via the mobile Steam Guard app, stop readInput() from handle2FA
 
         logger("debug", `[${this.logOnOptions.accountName}] getRefreshToken(): Login request successful, '${this.session.accountName}' authenticated. Resolving Promise...`);
@@ -30,12 +32,17 @@ sessionHandler.prototype._attachEvents = function() {
 
 
     this.session.on("timeout", () => { // Login attempt took too long, failure
-
-        // TODO: Retry?
+        global.renderQrChallenge = null; // RENDER: clear pending QR from status page
 
         logger("warn", `[${this.logOnOptions.accountName}] Login attempt timed out!`);
 
         this._resolvePromise(null);
+
+        // RENDER: Retry QR logins automatically so a missed scan doesn't leave the account skipped forever
+        if (this.logOnOptions.password == "qrcode") {
+            logger("info", `[${this.logOnOptions.accountName}] QR login will automatically retry in 60 seconds...`);
+            setTimeout(() => this.bot.login(), 60000);
+        }
     });
 
 

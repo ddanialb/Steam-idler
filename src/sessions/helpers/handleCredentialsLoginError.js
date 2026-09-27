@@ -48,6 +48,12 @@ sessionHandler.prototype._handleQrCodeLoginError = function(err) {
     logger("error", `[${this.logOnOptions.accountName}] Failed to start a QR-Code session! Are you having connectivity issues to Steam? ${err}`);
     logger("debug", err.stack, true);
 
+    global.renderQrChallenge = null; // RENDER: clear pending QR from status page
+
     this._resolvePromise(null); // Skips account
+
+    // RENDER: Retry QR logins automatically (there is no terminal to restart on Render)
+    logger("info", `[${this.logOnOptions.accountName}] QR login will automatically retry in 60 seconds...`);
+    setTimeout(() => this.bot.login(), 60000);
 
 };
