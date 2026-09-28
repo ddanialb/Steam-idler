@@ -16,7 +16,7 @@
 
 
 const SteamSession = require("steam-session"); // Only needed for the enum definitions below
-const qrcode       = require("qrcode");
+// qrcode library no longer needed here - QR is rendered by the control panel (panel.js)
 const { StartSessionResponse } = require("steam-session/dist/interfaces-external.js"); // eslint-disable-line
 
 const sessionHandler = require("../sessionHandler.js");
@@ -120,24 +120,15 @@ sessionHandler.prototype._acceptSteamGuardCode = function(code) {
  */
 sessionHandler.prototype._handleQRCode = function(res) {
 
-    // RENDER: expose the QR challenge so the status page in idler.js can display it in the browser
-    global.renderQrChallenge = {
+    // RENDER: expose the QR challenge to the control panel (per account) instead of spamming it in the terminal
+    if (!global.renderQrChallenges) global.renderQrChallenges = {};
+
+    global.renderQrChallenges[this.logOnOptions.accountName] = {
         accountName: this.logOnOptions.accountName,
         url: res.qrChallengeUrl,
         requestedAt: Date.now()
     };
 
-    // Display QR Code using qrcode library
-    qrcode.toString(res.qrChallengeUrl, (err, string) => {
-        if (err) {
-            logger("error", `[${this.logOnOptions.accountName}] Failed to display QR Code! Is the URL '${res.qrChallengeUrl}' invalid? ${err}`);
-            return this._resolvePromise(null);
-        }
-
-        logger("info", `[${this.logOnOptions.accountName}] Scan the following QR Code using your Steam Mobile App to start a new session:\n${string}`, true);
-
-        // Quick hack to prevent other messages from logging and pushing the QRCode up - start an empty readInput request which will be stopped by the authenticated event handler
-        logger.readInput("", 90000, () => {});
-    });
+    logger("info", `[${this.logOnOptions.accountName}] QR login requested - scan the QR code shown in the control panel with your Steam Mobile App to log in.`, true);
 
 };

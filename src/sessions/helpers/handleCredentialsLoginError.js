@@ -48,7 +48,7 @@ sessionHandler.prototype._handleQrCodeLoginError = function(err) {
     logger("error", `[${this.logOnOptions.accountName}] Failed to start a QR-Code session! Are you having connectivity issues to Steam? ${err}`);
     logger("debug", err.stack, true);
 
-    global.renderQrChallenge = null; // RENDER: clear pending QR from status page
+    if (global.renderQrChallenges) delete global.renderQrChallenges[this.logOnOptions.accountName]; // RENDER: clear pending QR from panel
 
     this._resolvePromise(null); // Skips account
 

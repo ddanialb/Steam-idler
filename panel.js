@@ -1,10 +1,11 @@
 /*
  * File: panel.js
  * Render control panel for steam-idler:
- * - Login system (admin via env, extra users created in-panel)
+ * - Login system (admin via env, extra users created in-panel, hashed passwords)
  * - Start/Stop farming & bot power per account
  * - Game search by name (multi-game idling)
  * - Auto-Stop timer & Auto-Restart watchdog per account
+ * - Per-account QR login inside the panel (users can add their own Steam account!)
  * State is kept in ./state.json (persists until redeploy)
  */
 
@@ -25,13 +26,15 @@ const PANEL_PASS  = process.env.PANEL_PASS || "";
 
 /* ---------------- State ---------------- */
 
-let state = { users: [], accounts: {} };
+let state = { users: [], accounts: {}, gameNames: {}, extraAccounts: [] };
 
 function loadState() {
     try {
         state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
         if (!state.users) state.users = [];
         if (!state.accounts) state.accounts = {};
+        if (!state.gameNames) state.gameNames = {};
+        if (!state.extraAccounts) state.extraAccounts = [];
     } catch (err) { /* fresh state */ }
 }
 
@@ -53,7 +56,7 @@ function getAccState(name, defaultGames) {
 
 /* ---------------- Auth ---------------- */
 
-const sessions = new Map(); // sid -> { user, exp }
+const sessions = new Map(); // sid -> { name, exp }
 
 function hashPass(pass, salt) {
     if (!salt) salt = crypto.randomBytes(16).toString("hex");
@@ -61,22 +64,28 @@ function hashPass(pass, salt) {
 }
 
 function checkAuth(username, pass) {
-    // Admin from env
-    if (PANEL_USER && username === PANEL_USER && pass === PANEL_PASS) return { name: username, role: "admin", accounts: null };
+    if (PANEL_USER && username === PANEL_USER && pass === PANEL_PASS) return { name: username, role: "admin" };
 
-    // Extra users
     const u = state.users.find(e => e.name === username);
     if (!u || !u.hash) return null;
 
     const [salt, hash] = u.hash.split(":");
     const calc = crypto.scryptSync(String(pass), salt, 32);
     const ref  = Buffer.from(hash, "hex");
-    if (ref.length == calc.length && crypto.timingSafeEqual(ref, calc)) return { name: u.name, role: "user", accounts: u.accounts || [] };
+    if (ref.length == calc.length && crypto.timingSafeEqual(ref, calc)) return { name: u.name, role: "user" };
 
     return null;
 }
 
-const loginFails = new Map(); // ip -> [timestamps]
+// Resolve fresh user data per request (so account assignments take effect without re-login)
+function resolveUser(name) {
+    if (PANEL_USER && name === PANEL_USER) return { name, role: "admin", accounts: null };
+    const u = state.users.find(e => e.name === name);
+    if (!u) return null;
+    return { name: u.name, role: "user", accounts: u.accounts || [] };
+}
+
+const loginFails = new Map();
 function tooManyFails(ip) {
     const now = Date.now();
     const arr = (loginFails.get(ip) || []).filter(t => now - t < 300000);
@@ -90,7 +99,7 @@ function getSession(req) {
     if (!m) return null;
     const s = sessions.get(m[1]);
     if (!s || s.exp < Date.now()) { sessions.delete(m[1]); return null; }
-    return s;
+    return resolveUser(s.name); // fresh data every request
 }
 
 /* ---------------- Steam helpers ---------------- */
@@ -103,7 +112,20 @@ function gameNameOf(g) {
     return names[g] || null;
 }
 
-// Search Steam apps by name (with short cache)
+// Create a bot for a user-added Steam account (QR login only - no password ever asked)
+function createDynamicBot(accountName) {
+    const Bot = require("./src/bot.js");
+    const loginindex = allBotsSafe().length;
+    const logOnOptions = { accountName, password: "qrcode", sharedSecret: null, steamGuardCode: null };
+
+    const bot = new Bot(logOnOptions, loginindex, [null]);
+    allBotsSafe().push(bot);
+    getAccState(accountName, [730]);
+    bot.login();
+    console.log(`[panel] User-added account '${accountName}' - QR login started`);
+    return bot;
+}
+
 const searchCache = new Map();
 async function searchApps(q) {
     const key = q.toLowerCase();
@@ -124,7 +146,7 @@ async function searchApps(q) {
     }
 }
 
-/* ---------------- Watchdog: Auto-Restart + Auto-Stop + state enforcement ---------------- */
+/* ---------------- Watchdog ---------------- */
 
 function startWatchdog() {
     setInterval(() => {
@@ -137,40 +159,37 @@ function startWatchdog() {
 
             const online = !!b.client.steamID;
 
-            // Auto-Stop timer reached -> turn everything off
-            if (s.stopAt && now >= s.stopAt) {
+            if (s.stopAt && now >= s.stopAt) { // Auto-Stop
                 s.stopAt = null; s.enabled = false; s.farming = false;
                 if (online) b.client.logOff();
                 b.startedPlayingTimestamp = 0;
                 b.playedAppIDs = [];
                 saveState();
-                if (global.logger) logger("info", `[${name}] Auto-Stop: timer reached, bot was stopped by the panel.`);
+                if (global.logger) logger("info", `[${name}] Auto-Stop: timer reached, bot stopped by panel.`);
                 continue;
             }
 
-            // Power off desired
-            if (!s.enabled && online) {
+            if (!s.enabled && online) { // Power off desired
                 b.client.logOff();
                 b.startedPlayingTimestamp = 0;
                 b.playedAppIDs = [];
                 continue;
             }
 
-            // Auto-Restart: went down without being disabled -> log in again
-            if (s.enabled && !online && s.autoRestart) {
+            if (s.enabled && !online && s.autoRestart) { // Auto-Restart
                 const loginPhaseDone = controller.nextacc > b.loginindex;
                 const inRelogQueue   = controller.relogQueue.includes(b.loginindex);
                 const lastTry        = b._panelLastLoginTry || 0;
+                const qrPending      = global.renderQrChallenges && global.renderQrChallenges[name];
 
-                if (loginPhaseDone && !inRelogQueue && now - lastTry > 120000 && !(global.renderQrChallenge && global.renderQrChallenge.accountName == name)) {
+                if (loginPhaseDone && !inRelogQueue && !qrPending && now - lastTry > 120000) {
                     b._panelLastLoginTry = now;
-                    if (global.logger) logger("info", `[${name}] Panel watchdog: account is offline, restarting login...`);
+                    if (global.logger) logger("info", `[${name}] Panel watchdog: account offline, restarting login...`);
                     b.login();
                 }
             }
 
-            // Farm state enforcement (also re-applies games after relog)
-            if (s.enabled && online) {
+            if (s.enabled && online) { // Farm enforcement
                 if (s.farming && b.startedPlayingTimestamp == 0) {
                     b.client.gamesPlayed(s.games);
                     b.startedPlayingTimestamp = now;
@@ -188,109 +207,137 @@ function startWatchdog() {
 /* ---------------- UI ---------------- */
 
 const maskName = (n) => String(n).slice(0, 2) + "***";
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
-function pageWrap(title, body, extraHead) {
+const CSS = ""
+    + "*{box-sizing:border-box;margin:0;padding:0}"
+    + "body{font-family:Tahoma,'Segoe UI',Arial,sans-serif;min-height:100vh;color:#e2e8f0;background:#060b18;background-image:radial-gradient(800px 400px at 85% -10%,rgba(37,99,235,.25),transparent),radial-gradient(700px 400px at 10% 110%,rgba(124,58,237,.18),transparent);padding:18px}"
+    + ".wrap{max-width:880px;margin:0 auto}"
+    + ".card{background:rgba(21,31,54,.85);border:1px solid #263855;border-radius:18px;padding:22px;margin-bottom:18px;backdrop-filter:blur(6px);box-shadow:0 8px 30px rgba(0,0,0,.35)}"
+    + "h1{font-size:22px;background:linear-gradient(90deg,#7dd3fc,#a5b4fc);-webkit-background-clip:text;background-clip:text;color:transparent}"
+    + "h2{font-size:15px;margin-bottom:8px;color:#a5b4fc}"
+    + ".sub{color:#8ea3c2;font-size:12px;margin-top:5px;line-height:1.7}"
+    + "input,select{background:#0b1526;border:1px solid #2c4066;color:#e2e8f0;border-radius:10px;padding:9px 12px;font-size:14px;font-family:inherit;outline:none;transition:border-color .15s, box-shadow .15s}"
+    + "input:focus,select:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.18)}"
+    + "button{border:none;color:#fff;border-radius:10px;padding:9px 16px;font-size:13px;cursor:pointer;font-family:inherit;font-weight:bold;transition:transform .08s,filter .15s;background:linear-gradient(135deg,#3b82f6,#6366f1);box-shadow:0 3px 12px rgba(59,130,246,.35)}"
+    + "button:hover{filter:brightness(1.12)} button:active{transform:scale(.96)}"
+    + "button.warn{background:linear-gradient(135deg,#f59e0b,#f97316);box-shadow:0 3px 12px rgba(245,158,11,.3)}"
+    + "button.danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 3px 12px rgba(239,68,68,.3)}"
+    + "button.ghost{background:#263855;box-shadow:none}"
+    + ".chip{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:bold}"
+    + ".ok{background:rgba(52,211,153,.14);color:#34d399}.wait{background:rgba(251,191,36,.14);color:#fbbf24}.bad{background:rgba(248,113,113,.14);color:#f87171}"
+    + ".dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;animation:p 1.4s infinite}"
+    + "@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}"
+    + ".gline{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:7px 0}"
+    + ".gamechip{background:#0b1526;border:1px solid #2c4066;border-radius:9px;padding:5px 10px;font-size:12px;display:inline-flex;gap:7px;align-items:center}"
+    + ".gamechip b{color:#7dd3fc}"
+    + ".x{color:#f87171;cursor:pointer;font-weight:bold;padding:0 2px}"
+    + ".x:hover{color:#fca5a5}"
+    + ".row{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}"
+    + ".res{border-top:1px dashed #2c4066;margin-top:10px;padding-top:6px;max-height:260px;overflow:auto}"
+    + ".resitem{display:flex;justify-content:space-between;align-items:center;padding:7px 2px;font-size:13px;border-bottom:1px solid rgba(44,64,102,.4)}"
+    + ".resitem:last-child{border-bottom:none}"
+    + ".muted{color:#64748b;font-size:11px}"
+    + "table{width:100%;font-size:13px;border-collapse:collapse} td,th{padding:7px 6px;text-align:right;border-bottom:1px solid rgba(44,64,102,.5)} th{color:#94a3b8;font-size:11px;border-bottom:1px solid #2c4066}"
+    + "img.qr{border-radius:12px;display:block;margin:12px auto;box-shadow:0 0 0 6px rgba(125,211,252,.15), 0 10px 30px rgba(0,0,0,.5)}"
+    + ".bar{position:sticky;top:0;z-index:10;background:rgba(6,11,24,.85);backdrop-filter:blur(10px);padding:12px 4px;margin:0 -4px 14px;border-bottom:1px solid rgba(44,64,102,.5)}"
+    + "#toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);background:#0f1d38;border:1px solid #3b82f6;color:#e2e8f0;padding:10px 20px;border-radius:12px;font-size:13px;z-index:99;opacity:0;transition:all .3s;box-shadow:0 8px 30px rgba(0,0,0,.5)}"
+    + "#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}"
+    + ".qrblock{border:1px solid #38bdf8;border-radius:14px;padding:16px;margin-top:14px;text-align:center;background:rgba(56,189,248,.06)}"
+    + ".qrtitle{color:#7dd3fc;font-weight:bold;font-size:15px;animation:p 1.6s infinite}"
+    + ".divider{border-top:1px dashed #2c4066;margin:14px 0 10px}"
+    + ".bigbtn{width:100%;padding:12px;font-size:15px;margin-top:6px}"
+    ;
+
+function pageWrap(title, body) {
     return "<!DOCTYPE html><html dir=\"rtl\" lang=\"fa\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        + "<title>" + title + "</title><style>"
-        + "*{box-sizing:border-box;margin:0;padding:0}"
-        + "body{font-family:Tahoma,Arial,sans-serif;background:#0b1120;color:#e2e8f0;min-height:100vh;padding:16px}"
-        + ".wrap{max-width:860px;margin:0 auto}"
-        + ".card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;margin-bottom:16px}"
-        + "h1{font-size:20px} h2{font-size:16px;margin-bottom:10px} .sub{color:#94a3b8;font-size:12px;margin-top:4px}"
-        + "input,select{background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:8px 10px;font-size:14px;font-family:inherit}"
-        + "button{background:#2563eb;border:none;color:#fff;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;font-family:inherit}"
-        + "button:hover{background:#1d4ed8} button.warn{background:#b45309} button.danger{background:#b91c1c} button.ghost{background:#334155}"
-        + ".chip{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px}"
-        + ".ok{background:rgba(74,222,128,.15);color:#4ade80}.wait{background:rgba(250,204,21,.15);color:#facc15}.bad{background:rgba(248,113,113,.15);color:#f87171}"
-        + ".gline{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}"
-        + ".gamechip{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:4px 8px;font-size:12px;display:inline-flex;gap:6px;align-items:center}"
-        + ".gamechip b{color:#7dd3fc}"
-        + ".x{color:#f87171;cursor:pointer;font-weight:bold}"
-        + ".row{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}"
-        + ".res{border-top:1px dashed #334155;margin-top:8px;padding-top:8px}"
-        + ".resitem{display:flex;justify-content:space-between;align-items:center;padding:5px 0;font-size:13px}"
-        + ".muted{color:#64748b;font-size:11px}"
-        + "table{width:100%;font-size:13px} td,th{padding:6px;text-align:right} th{color:#94a3b8;font-size:11px}"
-        + "img.qr{border-radius:10px;display:block;margin:10px auto}"
-        + ".bar{position:sticky;top:0;background:#0b1120;padding:10px 0;z-index:5}"
-        + "</style>" + (extraHead || "") + "</head><body><div class=\"wrap\">" + body + "</div></body></html>";
+        + "<title>" + title + "</title><style>" + CSS + "</style></head><body><div id=\"toast\"></div><div class=\"wrap\">" + body + "</div></body></html>";
 }
 
 function loginPage(msg) {
     return pageWrap("ورود | Steam Idler",
-        "<div class=\"card\" style=\"max-width:380px;margin:10vh auto 0;text-align:center\">"
-        + "<h1>🎮 Steam Idler</h1><p class=\"sub\">برای ورود به پنل، یوزرنیم و رمز رو وارد کن</p>"
-        + (msg ? "<p style=\"color:#f87171;font-size:13px;margin:10px 0\">" + msg + "</p>" : "")
-        + "<div class=\"gline\" style=\"margin-top:14px\"><input id=\"u\" placeholder=\"یوزرنیم\" style=\"flex:1\"></div>"
-        + "<div class=\"gline\"><input id=\"p\" type=\"password\" placeholder=\"رمز عبور\" style=\"flex:1\"></div>"
-        + "<button onclick=\"login()\" style=\"width:100%;margin-top:6px\">ورود</button>"
-        + "<p class=\"muted\" style=\"margin-top:14px\">دسترسی بدون رمز به هیچ بخشی از پنل ممکن نیست 🔒</p></div>"
-        + "<script>function login(){fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({u:document.getElementById('u').value,p:document.getElementById('p').value})}).then(r=>r.json()).then(d=>{if(d.ok)location.href='/';else location.href='/?err='+encodeURIComponent(d.err||'خطا')}).catch(()=>{location.href='/?err=خطا'})}document.addEventListener('keydown',e=>{if(e.key==='Enter')login()})</script>");
+        "<div style=\"min-height:85vh;display:flex;align-items:center;justify-content:center\">"
+        + "<div class=\"card\" style=\"width:100%;max-width:400px;text-align:center\">"
+        + "<div style=\"font-size:52px;line-height:1\">🎮</div>"
+        + "<h1 style=\"margin-top:8px\">Steam Idler</h1>"
+        + "<p class=\"sub\">پنل کنترل فارم ساعت — برای ادامه وارد شو</p>"
+        + (msg ? "<div class=\"chip bad\" style=\"margin:12px auto;display:table\">" + esc(msg) + "</div>" : "")
+        + "<div style=\"text-align:right;margin-top:16px\">"
+        + "<div class=\"gline\"><input id=\"u\" placeholder=\"👤 یوزرنیم\" style=\"flex:1\" autocomplete=\"username\"></div>"
+        + "<div class=\"gline\"><input id=\"p\" type=\"password\" placeholder=\"🔑 رمز عبور\" style=\"flex:1\" autocomplete=\"current-password\"></div>"
+        + "<button class=\"bigbtn\" onclick=\"login()\">ورود به پنل 🚀</button></div>"
+        + "<p class=\"muted\" style=\"margin-top:16px\">🔒 دسترسی به هیچ بخشی بدون ورود ممکن نیست</p></div></div>"
+        + "<script>function login(){fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({u:document.getElementById('u').value,p:document.getElementById('p').value})}).then(r=>r.json()).then(d=>{if(d.ok)location.replace('/');else location.replace('/?err='+encodeURIComponent(d.err||'خطا'))}).catch(()=>{location.replace('/?err=خطای اتصال')})}document.addEventListener('keydown',function(e){if(e.key==='Enter')login()});</script>");
 }
 
 function dashPage(user) {
     const isAdmin = user.role === "admin";
     const body =
-        "<div class=\"bar row\"><div><h1>🎮 Steam Idler</h1><p class=\"sub\">پنل مدیریت — سلام <b>" + esc(user.name) + "</b>" + (isAdmin ? " (ادمین)" : "") + "</p></div>"
-        + "<div class=\"gline\"><span class=\"chip ok\" id=\"up\">⏱ ...</span><button class=\"ghost\" onclick=\"logout()\">خروج</button></div></div>"
+        "<div class=\"bar row\"><div><h1>🎮 Steam Idler</h1><p class=\"sub\" style=\"margin-top:2px\">سلام <b style=\"color:#a5b4fc\">" + esc(user.name) + "</b>" + (isAdmin ? " 👑" : "") + " — به پنل خوش اومدی</p></div>"
+        + "<div class=\"gline\" style=\"margin:0\"><span class=\"chip ok\" id=\"up\">⏱ ...</span><button class=\"ghost\" onclick=\"logout()\">خروج ⎋</button></div></div>"
+        + "<div class=\"card\"><h2>➕ افزودن اکانت استیم (بدون پسورد، با QR)</h2>"
+        + "<p class=\"sub\">یوزرنیم استیمت رو بنویس و «افزودن» رو بزن — بلافاصله یه QR مخصوص خودت پایین همین کارت اکانتت میاد، با اپ Steam اسکنش کن.</p>"
+        + "<div class=\"gline\" style=\"margin-top:10px\"><input id=\"newacc\" placeholder=\"یوزرنیم استیم...\" style=\"flex:1;min-width:150px\"><button onclick=\"addaccount()\">➕ افزودن اکانت</button></div></div>"
         + "<div id=\"accs\"></div>"
         + (isAdmin ? adminHtml() : "")
-        + "<p class=\"muted\" style=\"text-align:center\">وضعیت‌ها هر ۸ ثانیه به‌روزرسانی می‌شوند 🔄 — تنظیمات این پنل تا Redeploy بعدی حفظ می‌شود.</p>"
+        + "<p class=\"muted\" style=\"text-align:center;margin-bottom:20px\">هر ۸ ثانیه به‌روزرسانی خودکار 🔄 — تنظیمات تا Redeploy بعدی حفظ می‌شوند</p>"
         + "<script>var ISADMIN=" + (isAdmin ? "true" : "false") + ";</script>"
         + "<script>" + clientJs() + "</script>";
 
-    return pageWrap("پنل | Steam Idler", body);
+    return pageWrap("🎮 پنل | Steam Idler", body);
 }
 
 function adminHtml() {
     return "<div class=\"card\"><h2>👥 مدیریت کاربرها (ادمین)</h2>"
-        + "<p class=\"sub\">برای هر رفیق یه یوزر/رمز بساز و اکانتش رو بهش اختصاص بده — خودش لاگین می‌کنه و بازی‌هاش رو تنظیم می‌کنه.</p>"
-        + "<div class=\"gline\" style=\"margin-top:10px\"><input id=\"nu\" placeholder=\"یوزرنیم\"><input id=\"np\" placeholder=\"رمز عبور\"><select id=\"na\"></select><button onclick=\"adduser()\" class=\"warn\">➕ ساخت کاربر</button></div>"
-        + "<table id=\"users\"><tr><th>یوزر</th><th>اکانت‌ها</th><th></th></tr></table></div>";
+        + "<p class=\"sub\">برای رفیقت یوزر/رمز بساز و بده بهش — خودش وارد می‌شه و اکانتش رو با QR اضافه می‌کنه. (اختیاری: از قبل یه اکانت بهش اختصاص بده)</p>"
+        + "<div class=\"gline\" style=\"margin-top:10px\"><input id=\"nu\" placeholder=\"یوزرنیم\"><input id=\"np\" placeholder=\"رمز عبور\"><select id=\"na\"><option value=\"\">— اکانت (اختیاری) —</option></select><button class=\"warn\" onclick=\"adduser()\">➕ ساخت کاربر</button></div>"
+        + "<table id=\"users\" style=\"margin-top:8px\"><tr><th>یوزر</th><th>اکانت‌ها</th><th></th></tr></table></div>";
 }
 
-function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-
-/* Client-side JS (no template literals inside!) */
+/* Client-side JS (string concat only) */
 function clientJs() {
     return ""
         + "var S=null;"
+        + "function toast(m,ok){var t=document.getElementById('toast');t.textContent=m;t.style.borderColor=ok===false?'#ef4444':'#34d399';t.className='show';setTimeout(function(){t.className=''},2600)}"
         + "function fmt(ms){var s=Math.max(0,Math.floor(ms/1000));var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' روز و ':'')+(h?h+' ساعت و ':'')+m+' دقیقه'}"
-        + "function esc(s){return String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]))}"
-        + "function post(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})}).then(r=>r.json()).then(j=>{load();return j})}"
-        + "function logout(){fetch('/api/logout',{method:'POST'}).then(()=>location.href='/')}"
+        + "function esc(s){return String(s).replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]})}"
+        + "function post(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})}).then(function(r){return r.json()}).then(function(j){load();return j})}"
+        + "function logout(){fetch('/api/logout',{method:'POST'}).then(function(){location.replace('/')}).catch(function(){location.replace('/')})}"
         + "function act(i,a,d){d=d||{};d.a=a;return post('/api/acc/'+i,d)}"
-        + "function farm(i,on){act(i,'farm',{on:on})}"
-        + "function power(i,on){act(i,'power',{on:on})}"
-        + "function arestart(i,on){act(i,'autorestart',{on:on})}"
-        + "function setstop(i){var h=parseInt(document.getElementById('sh'+i).value||'0'),m=parseInt(document.getElementById('sm'+i).value||'0');act(i,'autostop',{h:h,m:m})}"
-        + "function clearstop(i){act(i,'autostop',{clear:true})}"
+        + "function farm(i,on){act(i,'farm',{on:on}).then(function(d){toast(d.ok!==false?(on?'▶ فارم شروع شد':'⏸ فارم متوقف شد'):(d.err||'خطا'),d.ok!==false)})}"
+        + "function power(i,on){act(i,'power',{on:on}).then(function(d){toast(d.ok!==false?(on?'⏻ بات روشن شد':'⏻ بات خاموش شد'):(d.err||'خطا'),d.ok!==false)})}"
+        + "function arestart(i,on){act(i,'autorestart',{on:on}).then(function(){toast('🔄 ری‌استارت خودکار '+(on?'روشن':'خاموش')+' شد')})}"
+        + "function setstop(i){var h=parseInt(document.getElementById('sh'+i).value||'0'),m=parseInt(document.getElementById('sm'+i).value||'0');act(i,'autostop',{h:h,m:m}).then(function(d){toast(d.err||'⏱ تایمر توقف ثبت شد',!d.err)})}"
+        + "function clearstop(i){act(i,'autostop',{clear:true}).then(function(){toast('⏱ تایمر حذف شد')})}"
         + "function delgame(i,appid){act(i,'delgame',{appid:appid})}"
-        + "function addgame(i,appid,name){act(i,'addgame',{appid:appid,name:name});document.getElementById('res'+i).innerHTML='';document.getElementById('q'+i).value=''}"
-        + "function search(i){var q=document.getElementById('q'+i).value.trim();if(q.length<2)return;document.getElementById('res'+i).innerHTML='<p class=\"muted\">جستجو...</p>';"
-        + "fetch('/api/search?q='+encodeURIComponent(q)).then(r=>r.json()).then(d=>{var h='';if(!d.r||!d.r.length)h='<p class=\"muted\">چیزی پیدا نشد.</p>';(d.r||[]).forEach(function(g){h+='<div class=\"resitem\"><span>'+esc(g.name)+' <b style=\"color:#7dd3fc\">('+g.appid+')</b></span><button onclick=\"addgame('+i+','+g.appid+',\''+esc(g.name).replace(/'/g,'')+'\')\">➕ افزودن</button></div>'});document.getElementById('res'+i).innerHTML=h})}"
-        + "function adduser(){var u=document.getElementById('nu').value,p=document.getElementById('np').value,a=document.getElementById('na').value;if(!u||!p)return alert('یوزر و رمز لازمه');post('/api/admin/user',{u:u,p:p,accounts:a?[a]:[]}).then(d=>{if(d.err)alert(d.err)})}"
-        + "function deluser(u){if(confirm('حذف کاربر '+u+'؟'))post('/api/admin/deluser',{u:u})}"
-        + "function load(){fetch('/api/state').then(r=>r.json()).then(d=>{S=d;document.getElementById('up').textContent='⏱ '+fmt(d.uptime);var h='';"
-        + "d.accounts.forEach(function(a){var cls=a.online?(a.farming?'ok':'wait'):'bad';var st=a.online?(a.farming?'🎮 در حال فارم':'✅ آنلاین (فارم خاموش)'):(a.enabled?'⏳ آفلاین':'⛔ خاموش');"
-        + "h+='<div class=\"card\"><div class=\"row\"><div><b style=\"font-size:16px\">'+esc(a.name)+'</b> <span class=\"chip '+cls+'\">'+st+'</span>'+(a.waitingQR?' <span class=\"chip wait\">📱 QR آماده‌ست</span>':'')+'</div>'"
-        + "+(a.session?'<span class=\"chip ok\">سشن: '+fmt(a.session)+'</span>':'')+'</div>';"
-        + "if(a.waitingQR){h+='<div class=\"card\" style=\"border-color:#7dd3fc;margin-top:10px\"><h2>🔐 تأیید ورود</h2><p class=\"sub\">با اپ Steam (بخش Steam Guard) این کد رو اسکن کن:</p><img class=\"qr\" id=\"qrimg'+a.i+'\" width=\"240\" height=\"240\" src=\"/api/qr?acc='+encodeURIComponent(a.nameRaw)+'\"></div>'}"
-        + "h+='<div class=\"gline\" style=\"margin-top:12px\"><span class=\"muted\">بازی‌ها:</span>';a.games.forEach(function(g){h+='<span class=\"gamechip\">'+esc(g.name||g.appid)+' <b>'+g.appid+'</b> <span class=\"x\" onclick=\"delgame('+a.i+','+g.appid+')\">✕</span></span>'});if(!a.games.length)h+='<span class=\"muted\">—</span>';h+='</div>';"
-        + "h+='<div class=\"gline\"><input id=\"q'+a.i+'\" placeholder=\"اسم بازی رو سرچ کن... مثلا CS2\" style=\"flex:1;min-width:160px\" onkeydown=\"if(event.key===\'Enter\')search('+a.i+')\"><button class=\"ghost\" onclick=\"search('+a.i+')\">🔍</button></div><div class=\"res\" id=\"res'+a.i+'\"></div>';"
-        + "h+='<div class=\"gline\" style=\"margin-top:12px;border-top:1px dashed #334155;padding-top:12px\">';"
-        + "h+=a.farming?'<button class=\"warn\" onclick=\"farm('+a.i+',false)\">⏸ توقف فارم</button>':'<button onclick=\"farm('+a.i+',true)\">▶ شروع فارم</button>';"
-        + "h+=a.enabled?'<button class=\"danger\" onclick=\"power('+a.i+',false)\">⏻ خاموش کردن بات</button>':'<button onclick=\"power('+a.i+',true)\">⏻ روشن کردن بات</button>';"
-        + "h+='<label class=\"muted\" style=\"cursor:pointer\"><input type=\"checkbox\" '+(a.autoRestart?'checked':'')+' onchange=\"arestart('+a.i+',this.checked)\"> ری‌استارت خودکار</label>';"
-        + "h+='</div>';"
-        + "h+='<div class=\"gline\">⏱ توقف خودکار بعد از <input id=\"sh'+a.i+'\" type=\"number\" min=\"0\" style=\"width:70px\" placeholder=\"ساعت\"> ساعت و <input id=\"sm'+a.i+'\" type=\"number\" min=\"0\" style=\"width:70px\" placeholder=\"دقیقه\"> دقیقه <button onclick=\"setstop('+a.i+')\">ثبت</button>';"
-        + "if(a.stopRemain)h+='<span class=\"chip wait\">باقی‌مانده: '+fmt(a.stopRemain)+'</span> <button class=\"ghost\" onclick=\"clearstop('+a.i+')\">حذف تایمر</button>';h+='</div></div>';});"
+        + "function addgame(i,appid,name){act(i,'addgame',{appid:appid,name:name}).then(function(d){if(d.err)toast(d.err,false);else toast('🎮 بازی اضافه شد')});var r=document.getElementById('res'+i);if(r)r.innerHTML='';var q=document.getElementById('q'+i);if(q)q.value=''}"
+        + "function search(i){var el=document.getElementById('q'+i);var q=el.value.trim();if(q.length<2){toast('حداقل ۲ حرف بنویس',false);return}document.getElementById('res'+i).innerHTML='<p class=\"muted\">🔍 در حال جستجو...</p>';"
+        + "fetch('/api/search?q='+encodeURIComponent(q)).then(function(r){return r.json()}).then(function(d){var h='';if(!d.r||!d.r.length)h='<p class=\"muted\">چیزی پیدا نشد.</p>';(d.r||[]).forEach(function(g){h+='<div class=\"resitem\"><span>🕹 '+esc(g.name)+' <b style=\"color:#7dd3fc\">('+g.appid+')</b></span><button onclick=\"addgame('+i+','+g.appid+',\''+esc(g.name).replace(/'/g,'')+'\')\">➕ افزودن</button></div>'});document.getElementById('res'+i).innerHTML=h}).catch(function(){toast('خطا در سرچ',false)})}"
+        + "function adduser(){var u=document.getElementById('nu').value.trim(),p=document.getElementById('np').value,a=document.getElementById('na').value;if(!u||!p){toast('یوزر و رمز لازمه',false);return}post('/api/admin/user',{u:u,p:p,accounts:a?[a]:[]}).then(function(d){if(d.err)toast(d.err,false);else{toast('✅ کاربر «'+u+'» ساخته شد');document.getElementById('nu').value='';document.getElementById('np').value=''}})}"
+        + "function deluser(u){if(confirm('حذف کاربر '+u+'؟'))post('/api/admin/deluser',{u:u}).then(function(){toast('کاربر حذف شد')})}"
+        + "function addaccount(){var el=document.getElementById('newacc');var v=el.value.trim();if(v.length<3){toast('یوزرنیم استیم معتبر نیست',false);return}post('/api/my/addaccount',{steamUser:v}).then(function(d){if(d.err)toast(d.err,false);else{el.value='';toast('✅ اکانت اضافه شد — QR رو اسکن کن')}})}"
+        + "function render(){var d=S;if(!d)return;document.getElementById('up').textContent='⏱ '+fmt(d.uptime);var h='';"
+        + "d.accounts.forEach(function(a){var cls=a.online?(a.isFarming?'ok':'wait'):'bad';var st=a.online?(a.isFarming?'در حال فارم':'آنلاین (فارم خاموش)'):(a.enabled?'در حال اتصال/آفلاین':'خاموش');var dot=a.online?'●':'●';"
+        + "h+='<div class=\"card\"><div class=\"row\"><div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap\"><b style=\"font-size:17px\">'+esc(a.name)+'</b><span class=\"chip '+cls+'\"><span class=\"dot\"></span>'+st+'</span></div>'"
+        + "+(a.session?'<span class=\"chip ok\">⏱ سشن: '+fmt(a.session)+'</span>':'')+'</div>';"
+        + "if(a.waitingQR){h+='<div class=\"qrblock\"><div class=\"qrtitle\">🔐 QR ورود آماده‌ست!</div><p class=\"sub\">اپ Steam ← Steam Guard 🛡️ ← اسکنر ← این کد رو اسکن کن</p><img class=\"qr\" width=\"230\" height=\"230\" src=\"/api/qr?acc='+encodeURIComponent(a.nameRaw)+'&t='+Date.now()+'\"></div>'}"
+        + "h+='<div class=\"divider\"></div><div class=\"gline\"><span class=\"muted\">🎯 بازی‌ها:</span>';a.games.forEach(function(g){h+='<span class=\"gamechip\">'+esc(g.name||g.appid)+' <b>'+g.appid+'</b> <span class=\"x\" onclick=\"delgame('+a.i+','+g.appid+')\">✕</span></span>'});if(!a.games.length)h+='<span class=\"muted\">—</span>';h+='</div>';"
+        + "h+='<div class=\"gline\"><input id=\"q'+a.i+'\" placeholder=\"اسم بازی رو سرچ کن... مثلا CS2\" style=\"flex:1;min-width:150px\" onkeydown=\"if(event.key===\'Enter\')search('+a.i+')\"><button class=\"ghost\" onclick=\"search('+a.i+')\">🔍 سرچ</button></div><div class=\"res\" id=\"res'+a.i+'\"></div>';"
+        + "h+='<div class=\"divider\"></div><div class=\"gline\">';"
+        + "h+=a.isFarming?'<button class=\"warn\" onclick=\"farm('+a.i+',false)\">⏸ توقف فارم</button>':'<button onclick=\"farm('+a.i+',true)\">▶ شروع فارم</button>';"
+        + "h+=a.enabled?'<button class=\"danger\" onclick=\"power('+a.i+',false)\">⏻ خاموش بات</button>':'<button onclick=\"power('+a.i+',true)\">⏻ روشن بات</button>';"
+        + "h+='<label class=\"muted\" style=\"cursor:pointer;display:flex;align-items:center;gap:5px\"><input type=\"checkbox\" '+(a.autoRestart?'checked':'')+' onchange=\"arestart('+a.i+',this.checked)\"> ری‌استارت خودکار</label></div>';"
+        + "h+='<div class=\"gline\">⏱ توقف خودکار: <input id=\"sh'+a.i+'\" type=\"number\" min=\"0\" style=\"width:75px\" placeholder=\"ساعت\"> ساعت <input id=\"sm'+a.i+'\" type=\"number\" min=\"0\" style=\"width:75px\" placeholder=\"دقیقه\"> دقیقه <button onclick=\"setstop('+a.i+')\">ثبت</button>';"
+        + "if(a.stopRemain)h+='<span class=\"chip wait\">⏳ '+fmt(a.stopRemain)+'</span><button class=\"ghost\" onclick=\"clearstop('+a.i+')\">✕</button>';h+='</div></div>';});"
+        + "if(!d.accounts.length)h='<div class=\"card\" style=\"text-align:center;color:#8ea3c2\">هنوز اکانتی بهت اختصاص داده نشده — از کارت بالا یوزرنیم استیمت رو اضافه کن 👆</div>';"
         + "document.getElementById('accs').innerHTML=h;"
-        + "if(ISADMIN){var sel='<option value=\"\">— اکانت —</option>';d.allAccounts.forEach(function(n){sel+='<option value=\"'+esc(n)+'\">'+esc(n)+'</option>'});var se=document.getElementById('na');if(se)se.innerHTML=sel;var ut='<tr><th>یوزر</th><th>اکانت‌ها</th><th></th></tr>';d.users.forEach(function(u){ut+='<tr><td>'+esc(u.name)+'</td><td>'+u.accounts.map(esc).join(', ')+'</td><td><button class=\"danger\" onclick=\"deluser(\''+esc(u.name)+'\')\">حذف</button></td></tr>'});var tb=document.getElementById('users');if(tb)tb.innerHTML=ut;}})}"
+        + "if(ISADMIN){var se=document.getElementById('na');if(se&&se.options.length<=1){d.allAccounts.forEach(function(n){var o=document.createElement('option');o.value=n;o.textContent=n;se.appendChild(o)})}"
+        + "var ut='<tr><th>یوزر</th><th>اکانت‌ها</th><th></th></tr>';if(!d.users.length)ut+='<tr><td colspan=\"3\" class=\"muted\" style=\"text-align:center\">هنوز کاربری نساختی</td></tr>';d.users.forEach(function(u){ut+='<tr><td>👤 '+esc(u.name)+'</td><td>'+(u.accounts.length?u.accounts.map(esc).join('، '):'<span class=\"muted\">(خودش اضافه می‌کنه)</span>')+'</td><td><button class=\"danger\" style=\"padding:5px 12px\" onclick=\"deluser(\''+esc(u.name)+'\')\">حذف</button></td></tr>'});var tb=document.getElementById('users');if(tb)tb.innerHTML=ut;}}"
+        + "function load(){fetch('/api/state').then(function(r){return r.json()}).then(function(d){if(d.ok){S=d;render()}else if(d.err==='unauthorized')location.replace('/')}).catch(function(){})}"
         + "load();setInterval(load,8000);";
 }
 
-/* ---------------- HTTP Server ---------------- */
+/* ---------------- HTTP ---------------- */
 
 function send(res, code, data, type) {
     const body = typeof data === "string" ? data : JSON.stringify(data);
@@ -306,7 +353,7 @@ function readBody(req) {
     });
 }
 
-const qrImgCache = new Map();
+const qrImgCache = new Map(); // accountName -> { url, dataUrl }
 
 function stateFor(user) {
     const now = Date.now();
@@ -321,16 +368,15 @@ function stateFor(user) {
             nameRaw: name,
             online,
             enabled: s.enabled,
-            farming: s.farming && online && b.startedPlayingTimestamp != 0 ? true : s.farming,
+            isFarming: online && b.startedPlayingTimestamp != 0,
             autoRestart: s.autoRestart,
             stopRemain: s.stopAt ? Math.max(0, s.stopAt - now) : 0,
             session: b.startedPlayingTimestamp ? now - b.startedPlayingTimestamp : 0,
             games: s.games.map(g => ({ appid: g, name: gameNameOf(g) })),
-            waitingQR: !!(global.renderQrChallenge && global.renderQrChallenge.accountName == name)
+            waitingQR: !!(global.renderQrChallenges && global.renderQrChallenges[name])
         };
     });
 
-    // Permission filter for regular users
     if (user.role !== "admin") accounts = accounts.filter(a => (user.accounts || []).includes(a.nameRaw));
 
     const out = {
@@ -358,8 +404,6 @@ async function handle(req, res) {
     const path = url.pathname;
     const user = getSession(req);
 
-    /* ----- Public ----- */
-
     if (path === "/" && req.method === "GET") {
         if (!user) return send(res, 200, loginPage(url.searchParams.get("err")), "text/html");
         return send(res, 200, dashPage(user), "text/html");
@@ -378,17 +422,18 @@ async function handle(req, res) {
         }
 
         const sid = crypto.randomBytes(16).toString("hex");
-        sessions.set(sid, { ...u, exp: Date.now() + 86400000 * 7 });
+        sessions.set(sid, { name: u.name, exp: Date.now() + 86400000 * 7 });
         res.setHeader("Set-Cookie", "sid=" + sid + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=" + 86400 * 7);
         return send(res, 200, { ok: true });
     }
 
-    /* ----- Below: auth required ----- */
+    /* ----- auth required ----- */
     if (!user) return send(res, 401, { ok: false, err: "unauthorized" });
 
     if (path === "/api/logout" && req.method === "POST") {
         const c = req.headers.cookie || ""; const m = c.match(/sid=([a-f0-9]{32})/);
         if (m) sessions.delete(m[1]);
+        res.setHeader("Set-Cookie", "sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
         return send(res, 200, { ok: true });
     }
 
@@ -402,25 +447,54 @@ async function handle(req, res) {
     }
 
     if (path === "/api/qr" && req.method === "GET") {
-        const qr  = global.renderQrChallenge;
         const acc = url.searchParams.get("acc") || "";
-        if (!qr || qr.accountName !== acc) return send(res, 404, { ok: false });
+        const qr  = global.renderQrChallenges ? global.renderQrChallenges[acc] : null;
+        if (!qr) return send(res, 404, { ok: false });
         if (user.role !== "admin" && !(user.accounts || []).includes(acc)) return send(res, 403, { ok: false });
 
         try {
-            if (!qrImgCache.has(qr.url)) qrImgCache.set(qr.url, await QRCode.toDataURL(qr.url, { scale: 9, margin: 2, color: { dark: "#0b1120", light: "#ffffff" } }));
-            const dataUrl = qrImgCache.get(qr.url);
-            const b64 = dataUrl.split(",")[1];
-            const buf = Buffer.from(b64, "base64");
+            const cached = qrImgCache.get(acc);
+            if (!cached || cached.url !== qr.url) {
+                qrImgCache.set(acc, { url: qr.url, dataUrl: await QRCode.toDataURL(qr.url, { scale: 9, margin: 2, color: { dark: "#0b1526", light: "#ffffff" } }) });
+            }
+            const buf = Buffer.from(qrImgCache.get(acc).dataUrl.split(",")[1], "base64");
             res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "no-store" });
             return res.end(buf);
         } catch (e) { return send(res, 500, { ok: false, err: String(e) }); }
     }
 
+    // Any logged-in user can add their OWN steam account (QR login only)
+    if (path === "/api/my/addaccount" && req.method === "POST") {
+        const body = await readBody(req);
+        const su = String(body.steamUser || "").trim();
+
+        if (!/^[A-Za-z0-9_]{3,32}$/.test(su)) return send(res, 400, { ok: false, err: "یوزرنیم استیم معتبر نیست (انگلیسی، ۳ تا ۳۲ کاراکتر)" });
+
+        const exists = allBotsSafe().find(b => b.logOnOptions.accountName.toLowerCase() === su.toLowerCase());
+        if (exists) {
+            // Already known account - only allow if it belongs to this user (or admin)
+            if (user.role === "admin" || (user.accounts || []).includes(exists.logOnOptions.accountName)) {
+                return send(res, 200, { ok: true, msg: "این اکانت از قبل هست" });
+            }
+            return send(res, 400, { ok: false, err: "این اکانت قبلاً توسط کس دیگه‌ای اضافه شده!" });
+        }
+
+        createDynamicBot(su);
+        state.extraAccounts.push({ name: su, owner: user.name });
+
+        if (user.role !== "admin") {
+            const u = state.users.find(e => e.name === user.name);
+            if (u) { if (!u.accounts) u.accounts = []; u.accounts.push(su); }
+        }
+
+        saveState();
+        return send(res, 200, { ok: true });
+    }
+
     const accM = path.match(/^\/api\/acc\/(\d+)$/);
     if (accM && req.method === "POST") {
         const b = botByIdx(parseInt(accM[1], 10), user);
-        if (!b) return send(res, 403, { ok: false, err: "دسترسی نداری" });
+        if (!b) return send(res, 403, { ok: false, err: "به این اکانت دسترسی نداری" });
 
         const body = await readBody(req);
         const name = b.logOnOptions.accountName;
@@ -471,17 +545,12 @@ async function handle(req, res) {
             case "addgame": {
                 const id = parseInt(body.appid, 10);
                 if (!id) return send(res, 400, { ok: false });
+                if (s.games.length >= 32 && !s.games.includes(id)) return send(res, 400, { ok: false, err: "استیم سقف ۳۲ بازی داره!" });
                 if (!s.games.includes(id)) s.games.push(id);
-                if (s.games.length > 32) return send(res, 400, { ok: false, err: "استیم سقف ۳۲ بازی داره!" });
+                if (body.name) state.gameNames[String(id)] = String(body.name).slice(0, 60);
                 if (s.farming && b.client.steamID) {
                     b.client.gamesPlayed(s.games);
                     b.playedAppIDs = s.games.slice();
-                }
-
-                // Remember friendly name in a side map (nothing else persists names)
-                if (body.name) {
-                    if (!state.gameNames) state.gameNames = {};
-                    state.gameNames[String(id)] = String(body.name).slice(0, 60);
                 }
                 break;
             }
@@ -497,7 +566,7 @@ async function handle(req, res) {
             }
 
             default:
-                return send(res, 400, { ok: false, err: "بد درخواست" });
+                return send(res, 400, { ok: false, err: "درخواست نامعتبر" });
         }
 
         saveState();
@@ -509,7 +578,8 @@ async function handle(req, res) {
         const body = await readBody(req);
         const nu = String(body.u || "").trim(), np = String(body.p || "");
 
-        if (nu.length < 3 || np.length < 4) return send(res, 400, { ok: false, err: "یوزر حداقل ۳ و رمز حداقل ۴ کاراکتر!" });
+        if (!/^[A-Za-z0-9_.-]{3,20}$/.test(nu)) return send(res, 400, { ok: false, err: "یوزر باید ۳ تا ۲۰ کاراکتر انگلیسی باشه" });
+        if (np.length < 4) return send(res, 400, { ok: false, err: "رمز حداقل ۴ کاراکتر!" });
         if (nu === PANEL_USER || state.users.some(e => e.name === nu)) return send(res, 400, { ok: false, err: "این یوزر تکراریه!" });
 
         state.users.push({ name: nu, hash: hashPass(np), accounts: Array.isArray(body.accounts) ? body.accounts.filter(a => allBotsSafe().some(b => b.logOnOptions.accountName === a)) : [] });
@@ -534,8 +604,22 @@ function attach(ctrl, cfg) {
     loadState();
 
     if (!PANEL_USER || !PANEL_PASS) {
-        console.log("⚠️  PANEL_USER / PANEL_PASS env vars are NOT set! Panel login is DISABLED — set them in Render!");
+        console.log("⚠️  PANEL_USER / PANEL_PASS env vars are NOT set! Panel login will reject everyone - set them in Render!");
     }
+
+    // Restore user-added accounts (they'll need a fresh QR scan, which shows in the panel)
+    setTimeout(() => {
+        for (const e of state.extraAccounts) {
+            if (!allBotsSafe().some(b => b.logOnOptions.accountName == e.name)) {
+                createDynamicBot(e.name);
+
+                // Re-assign ownership (state.users keeps accounts array, but make sure)
+                const owner = state.users.find(u => u.name === e.owner);
+                if (owner && !owner.accounts.includes(e.name)) owner.accounts.push(e.name);
+            }
+        }
+        saveState();
+    }, 12000);
 
     http.createServer((req, res) => {
         handle(req, res).catch((err) => {
