@@ -264,7 +264,7 @@ Bot.prototype.attachEventListeners = function() {
                 logger("info", `[${this.logOnOptions.accountName}] Playing session unblocked - user stopped playing on their PC. Resuming idling...`);
 
                 // Immediately re-claim the games so idling resumes instantly
-                this.client.gamesPlayed(this.playedAppIDs);
+                if (this.playedAppIDs.length > 0) this.client.gamesPlayed(this.playedAppIDs);
             }
 
             this.userPlayingElsewhere = false;

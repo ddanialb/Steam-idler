@@ -31,20 +31,23 @@ sessionHandler.prototype._handle2FA = function(res) {
 
     // Get 2FA code/prompt confirmation from user, mentioning the correct source
     switch (res.validActions[0].type) {
-        case SteamSession.EAuthSessionGuardType.EmailCode:          // Type 2
-            logger("info", `Please enter the Steam Guard Code from your email address at ${res.validActions[0].detail}. Skipping automatically in 1.5 minutes if you don't respond...`, true);
+        case SteamSession.EAuthSessionGuardType.EmailCode:          // Type 2 (code from email)
+        case SteamSession.EAuthSessionGuardType.DeviceCode: {       // Type 3 (code from mobile app)
+            const type = (res.validActions[0].type == SteamSession.EAuthSessionGuardType.EmailCode) ? "email" : "mobile";
 
-            this._get2FAUserInput();
+            // RENDER: expose the pending guard code to the control panel so the user can enter it there
+            if (!global.render2FAPending) global.render2FAPending = {};
+
+            global.render2FAPending[this.logOnOptions.accountName] = { type, detail: res.validActions[0].detail || "", handler: this, requestedAt: Date.now() };
+
+            logger("info", `[${this.logOnOptions.accountName}] Steam Guard Code (${type}) required - enter it in the control panel.`, true);
+
+            if (process.stdin.isTTY) this._get2FAUserInput(); // Keep classic terminal input when running locally
             break;
+        }
 
         case SteamSession.EAuthSessionGuardType.DeviceConfirmation: // Type 4 (more convenient than type 3, both can be active at the same time so we check for this one first)
             logger("info", "Please confirm this login request in your Steam Mobile App.", false, false, logger.animation("waiting"));
-            break;
-
-        case SteamSession.EAuthSessionGuardType.DeviceCode:         // Type 3
-            logger("info", "Please enter the Steam Guard Code from your Steam Mobile App. Skipping automatically in 1.5 minutes if you don't respond...", true);
-
-            this._get2FAUserInput();
             break;
 
         case SteamSession.EAuthSessionGuardType.EmailConfirmation:  // Type 5
@@ -57,6 +60,37 @@ sessionHandler.prototype._handle2FA = function(res) {
             this._resolvePromise(null);
             return;
     }
+};
+
+
+/**
+ * RENDER: Submit a Steam Guard code entered in the control panel
+ * @param {string} code The guard code typed by the user
+ * @param {function(boolean, string): void} cb Called with (success, errorMessage)
+ */
+sessionHandler.prototype._submitGuardCodeFromPanel = function(code, cb) {
+
+    this.session.submitSteamGuardCode(code)
+        .then(() => { // Success - authenticated event will resolve the login
+            if (global.render2FAPending) delete global.render2FAPending[this.logOnOptions.accountName]; // keep cleared state until authenticated replaces it
+            cb(true, "");
+        })
+        .catch((err) => {
+            // Skip account if account got temp blocked
+            if (err.eresult == SteamSession.EResult.RateLimitExceeded || err.eresult == SteamSession.EResult.AccountLoginDeniedThrottle || err.eresult == SteamSession.EResult.AccessDenied) {
+                logger("error", `[${this.logOnOptions.accountName}] Steam rejected our login and applied a temporary login cooldown! ${err}`);
+
+                this.session.cancelLoginAttempt();
+                if (global.render2FAPending) delete global.render2FAPending[this.logOnOptions.accountName];
+
+                this._resolvePromise(null);
+                cb(false, "استیم موقتاً محدود کرد — چند دقیقه صبر کن و ری‌استارت بزن");
+                return;
+            }
+
+            cb(false, "کد اشتباهه — دوباره وارد کن");
+        });
+
 };
 
 

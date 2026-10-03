@@ -153,11 +153,32 @@ function deluser(u) {
 
 function addaccount() {
     var el = document.getElementById('newacc');
+    var pw = document.getElementById('newpass');
     var v = el.value.trim();
     if (v.length < 3) { toast('یوزرنیم استیم معتبر نیست', false); return; }
-    post('/api/my/addaccount', { steamUser: v }).then(function(d) {
+    post('/api/my/addaccount', { steamUser: v, steamPass: pw.value }).then(function(d) {
         if (d.err) toast(d.err, false);
-        else { el.value = ''; toast('✅ اکانت اضافه شد — QR رو با اپ Steam اسکن کن'); }
+        else { el.value = ''; pw.value = ''; toast('✅ اکانت اضافه شد'); }
+        load();
+    });
+}
+
+function qrretry(t) {
+    t.onerror = null;
+    t.style.opacity = 0.25;
+    setTimeout(function() {
+        t.src = t.src.split('&t=')[0] + '&t=' + Date.now();
+        t.style.opacity = 1;
+    }, 3000);
+}
+
+function send2fa(i) {
+    var el = document.getElementById('fa' + i);
+    var code = el.value.trim();
+    if (!code) { toast('کد رو بنویس', false); return; }
+    act(i, '2fa', { code: code }).then(function(d) {
+        if (d.err) toast(d.err, false);
+        else { el.value = ''; toast('✅ کد قبول شد — دارم لاگین می‌کنم...'); }
     });
 }
 
@@ -174,7 +195,16 @@ function accCard(a) {
 
     if (a.waitingQR) {
         h += '<div class="qrblock"><div class="qrtitle">🔐 با اپ Steam اسکن کن</div>'
-            + '<img class="qr" width="230" height="230" alt="QR" src="/api/qr?acc=' + encodeURIComponent(a.nameRaw) + '&t=' + Date.now() + '"></div>';
+            + '<img class="qr" width="230" height="230" alt="QR" src="/api/qr?acc=' + encodeURIComponent(a.nameRaw) + '&t=' + Date.now() + '" onerror="qrretry(this)"></div>';
+    }
+
+    if (a.needs2FA) {
+        h += '<div class="qrblock"><div class="qrtitle">🛡 کد Steam Guard' + (a.guardType === 'email' ? ' (ایمیل)' : ' (اپ)') + '</div>'
+            + '<div class="gline" style="justify-content:center;margin:10px 0 0"><input id="fa' + a.i + '" maxlength="6" autocomplete="off" placeholder="کد..." style="width:130px;text-align:center;font-size:18px;letter-spacing:4px" onkeydown="if(event.keyCode===13)send2fa(' + a.i + ')"><button onclick="send2fa(' + a.i + ')">تأیید</button></div></div>';
+    }
+
+    if (a.enabled && !a.online && !a.waitingQR && !a.needs2FA && !a.userPlaying) {
+        h += '<div class="gline" style="margin-top:10px;justify-content:center"><span class="muted"><span class="spin"></span>در حال آماده‌سازی ورود...</span></div>';
     }
 
     h += '<div class="divider"></div><div class="gline"><span class="muted">🎯 بازی‌ها:</span>';
@@ -201,8 +231,7 @@ function accCard(a) {
         : '<button class="bfarm" onclick="power(' + a.i + ',true)">⏻ روشن</button>';
     h += '<button class="brestart" onclick="restartacc(' + a.i + ')">🔄 ری‌استارت</button>';
     h += '<button class="ghost" onclick="gettoken(' + a.i + ')">🔑 توکن</button>';
-    h += '<label class="muted" style="cursor:pointer;display:flex;align-items:center;gap:5px">'
-        + '<input type="checkbox" ' + (a.autoRestart ? 'checked' : '') + ' onchange="arestart(' + a.i + ',this.checked)"> ری‌استارت خودکار</label></div>';
+    h += '<label class="switch"><input type="checkbox" ' + (a.autoRestart ? 'checked' : '') + ' onchange="arestart(' + a.i + ',this.checked)"><span class="sw"></span>ری‌استارت خودکار</label></div>';
     h += '<div class="tokenbox" id="tok' + a.i + '" style="display:none">'
         + '<input id="tokv' + a.i + '" readonly value="">'
         + '<button class="ghost" onclick="copytok(' + a.i + ')">📋 کپی</button></div>';

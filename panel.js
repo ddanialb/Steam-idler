@@ -113,16 +113,16 @@ function gameNameOf(g) {
 }
 
 // Create a bot for a user-added Steam account (QR login only - no password ever asked)
-function createDynamicBot(accountName) {
+function createDynamicBot(accountName, password) {
     const Bot = require("./src/bot.js");
     const loginindex = allBotsSafe().length;
-    const logOnOptions = { accountName, password: "qrcode", sharedSecret: null, steamGuardCode: null };
+    const logOnOptions = { accountName, password: password || "qrcode", sharedSecret: null, steamGuardCode: null };
 
     const bot = new Bot(logOnOptions, loginindex, [null]);
     allBotsSafe().push(bot);
     getAccState(accountName, [730]);
     bot.login();
-    console.log(`[panel] User-added account '${accountName}' - QR login started`);
+    console.log(`[panel] User-added account '${accountName}' - login started (${password ? "credentials" : "QR"})`);
     return bot;
 }
 
@@ -264,6 +264,14 @@ const CSS = ""
     + ".qrblock{border:1px solid #38bdf8;border-radius:14px;padding:16px;margin-top:14px;text-align:center;background:rgba(56,189,248,.06)}"
     + ".qrtitle{color:#7dd3fc;font-weight:bold;font-size:15px;animation:p 1.6s infinite}"
     + ".divider{border-top:1px dashed #2c4066;margin:14px 0 10px}"
+    + ".switch{position:relative;display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:#8ea3c2}"
+    + ".switch input{display:none}"
+    + ".sw{width:42px;height:23px;background:#263855;border:1px solid #2c4066;border-radius:999px;position:relative;transition:.25s;flex-shrink:0}"
+    + ".sw:before{content:'';position:absolute;top:2px;right:2px;width:17px;height:17px;border-radius:50%;background:#64748b;transition:.25s}"
+    + ".switch input:checked + .sw{background:rgba(34,197,94,.3);border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,.25)}"
+    + ".switch input:checked + .sw:before{transform:translateX(-19px);background:#22c55e}"
+    + ".spin{display:inline-block;width:16px;height:16px;border:2px solid #2c4066;border-top-color:#7dd3fc;border-radius:50%;animation:rot 1s linear infinite;vertical-align:-3px;margin-left:6px}"
+    + "@keyframes rot{to{transform:rotate(360deg)}}"
     + ".bigbtn{width:100%;padding:12px;font-size:15px;margin-top:6px}"
     ;
 
@@ -292,7 +300,7 @@ function dashPage(user) {
     const body =
         "<div class=\"bar row\"><div><h1>🎮 Steam Idler</h1><p class=\"sub\" style=\"margin-top:2px\">👤 <b style=\"color:#a5b4fc\">" + esc(user.name) + "</b>" + (isAdmin ? " 👑" : "") + "</p></div>"
         + "<div class=\"gline\" style=\"margin:0\"><span class=\"chip ok\" id=\"up\">⏱ ...</span><button class=\"ghost\" onclick=\"logout()\">خروج ⎋</button></div></div>"
-        + "<div class=\"card\"><div class=\"gline\" style=\"margin:0\"><input id=\"newacc\" placeholder=\"➕ یوزرنیم استیم...\" style=\"flex:1;min-width:150px\"><button onclick=\"addaccount()\">افزودن اکانت</button></div></div>"
+        + "<div class=\"card\"><div class=\"gline\" style=\"margin:0\"><input id=\"newacc\" placeholder=\"➕ یوزرنیم استیم...\" style=\"flex:1;min-width:130px\"><input id=\"newpass\" type=\"password\" placeholder=\"رمز (خالی = با QR)\" style=\"flex:1;min-width:130px\" autocomplete=\"off\"><button onclick=\"addaccount()\">افزودن</button></div></div>"
         + "<div id=\"accs\"></div>"
         + (isAdmin ? adminHtml() : "")
         + "<script>var ISADMIN=" + (isAdmin ? "true" : "false") + ";</script>"
@@ -346,7 +354,9 @@ function stateFor(user) {
             stopRemain: s.stopAt ? Math.max(0, s.stopAt - now) : 0,
             session: b.startedPlayingTimestamp ? now - b.startedPlayingTimestamp : 0,
             games: s.games.map(g => ({ appid: g, name: gameNameOf(g) })),
-            waitingQR: !!(global.renderQrChallenges && global.renderQrChallenges[name])
+            waitingQR: !!(global.renderQrChallenges && global.renderQrChallenges[name]),
+            needs2FA: !!(global.render2FAPending && global.render2FAPending[name]),
+            guardType: (global.render2FAPending && global.render2FAPending[name]) ? global.render2FAPending[name].type : null
         };
     });
 
@@ -478,6 +488,7 @@ async function handle(req, res) {
     if (path === "/api/my/addaccount" && req.method === "POST") {
         const body = await readBody(req);
         const su = String(body.steamUser || "").trim();
+        const sp = String(body.steamPass || "").trim();
 
         if (!/^[A-Za-z0-9_]{3,32}$/.test(su)) return send(res, 400, { ok: false, err: "یوزرنیم استیم معتبر نیست (انگلیسی، ۳ تا ۳۲ کاراکتر)" });
 
@@ -490,7 +501,7 @@ async function handle(req, res) {
             return send(res, 400, { ok: false, err: "این اکانت قبلاً توسط کس دیگه‌ای اضافه شده!" });
         }
 
-        createDynamicBot(su);
+        createDynamicBot(su, sp);
         state.extraAccounts.push({ name: su, owner: user.name });
 
         if (user.role !== "admin") {
@@ -542,6 +553,20 @@ async function handle(req, res) {
             case "autorestart":
                 s.autoRestart = !!body.on;
                 break;
+
+            case "2fa": { // Submit Steam Guard code entered in the panel
+                const pending = global.render2FAPending ? global.render2FAPending[name] : null;
+
+                if (!pending) return send(res, 400, { ok: false, err: "الان کدی ازت خواسته نشده" });
+
+                const code = String(body.code || "").trim();
+                if (!code) return send(res, 400, { ok: false, err: "کد رو بنویس" });
+
+                const result = await new Promise(resolve => pending.handler._submitGuardCodeFromPanel(code, (ok, msg) => resolve({ ok, msg })));
+
+                if (!result.ok) return send(res, 400, { ok: false, err: result.msg || "کد قبول نشد" });
+                break; // Success: authenticated event takes it from here
+            }
 
             case "restart": // Hard restart: force fresh login (drops any stale/blocked session state)
                 s.enabled = true;

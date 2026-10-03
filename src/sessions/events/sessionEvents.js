@@ -22,6 +22,7 @@ sessionHandler.prototype._attachEvents = function() {
 
     this.session.on("authenticated", () => { // Success
         if (global.renderQrChallenges) delete global.renderQrChallenges[this.logOnOptions.accountName]; // RENDER: QR approved, remove from panel
+        if (global.render2FAPending) delete global.render2FAPending[this.logOnOptions.accountName];     // RENDER: guard code accepted
 
         try { logger.stopReadInput("Login request accepted"); } catch (e) { /* no readInput active on servers */ }
 
@@ -33,6 +34,7 @@ sessionHandler.prototype._attachEvents = function() {
 
     this.session.on("timeout", () => { // Login attempt took too long, failure
         if (global.renderQrChallenges) delete global.renderQrChallenges[this.logOnOptions.accountName]; // RENDER: clear pending QR from panel
+        if (global.render2FAPending) delete global.render2FAPending[this.logOnOptions.accountName];     // RENDER: clear pending guard prompt
 
         logger("warn", `[${this.logOnOptions.accountName}] Login attempt timed out!`);
 
@@ -47,6 +49,8 @@ sessionHandler.prototype._attachEvents = function() {
 
 
     this.session.on("error", (err) => { // Failure
+        if (global.render2FAPending) delete global.render2FAPending[this.logOnOptions.accountName]; // RENDER: clear pending guard prompt on failure
+
         logger("error", `[${this.logOnOptions.accountName}] Failed to get a session for account '${this.logOnOptions.accountName}'! Error: ${err.stack ? err.stack : err}`); // Session.accountName is only defined on success
 
         // TODO: When does this event fire? Do I need to do something else?
