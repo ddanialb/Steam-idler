@@ -181,19 +181,27 @@ function startWatchdog() {
                 const inRelogQueue   = controller.relogQueue.includes(b.loginindex);
                 const lastTry        = b._panelLastLoginTry || 0;
                 const qrPending      = global.renderQrChallenges && global.renderQrChallenges[name];
+                const cooldown       = b.userPlayingElsewhere ? 300000 : 120000; // gentler while the user plays on their PC
 
-                if (loginPhaseDone && !inRelogQueue && !qrPending && now - lastTry > 120000) {
+                if (loginPhaseDone && !inRelogQueue && !qrPending && now - lastTry > cooldown) {
                     b._panelLastLoginTry = now;
                     if (global.logger) logger("info", `[${name}] Panel watchdog: account offline, restarting login...`);
                     b.login();
                 }
             }
 
-            if (s.enabled && online) { // Farm enforcement
-                if (s.farming && b.startedPlayingTimestamp == 0) {
-                    b.client.gamesPlayed(s.games);
-                    b.startedPlayingTimestamp = now;
-                    b.playedAppIDs = s.games.slice();
+            if (s.enabled && online) { // Farm enforcement + keep-alive probe
+                if (s.farming) {
+                    if (b.startedPlayingTimestamp == 0 && !b.userPlayingElsewhere) {
+                        b.client.gamesPlayed(s.games);
+                        b.startedPlayingTimestamp = now;
+                        b.playedAppIDs = s.games.slice();
+                    } else if (now - (b._lastPlayProbe || 0) > 180000) {
+                        // Re-assert our gamesPlayed every 3 min: keeps the session claimed AND auto-resumes idling
+                        // as soon as the user stops playing on their own PC (blocked claims don't disturb their game)
+                        b._lastPlayProbe = now;
+                        b.client.gamesPlayed(s.games);
+                    }
                 } else if (!s.farming && b.startedPlayingTimestamp != 0) {
                     b.client.gamesPlayed([]);
                     b.startedPlayingTimestamp = 0;
@@ -260,27 +268,23 @@ function loginPage(msg) {
         + "<div class=\"card\" style=\"width:100%;max-width:400px;text-align:center\">"
         + "<div style=\"font-size:52px;line-height:1\">🎮</div>"
         + "<h1 style=\"margin-top:8px\">Steam Idler</h1>"
-        + "<p class=\"sub\">پنل کنترل فارم ساعت — برای ادامه وارد شو</p>"
         + (msg ? "<div class=\"chip bad\" style=\"margin:12px auto;display:table\">" + esc(msg) + "</div>" : "")
         + "<div style=\"text-align:right;margin-top:16px\">"
         + "<div class=\"gline\"><input id=\"u\" placeholder=\"👤 یوزرنیم\" style=\"flex:1\" autocomplete=\"username\"></div>"
         + "<div class=\"gline\"><input id=\"p\" type=\"password\" placeholder=\"🔑 رمز عبور\" style=\"flex:1\" autocomplete=\"current-password\"></div>"
         + "<button class=\"bigbtn\" onclick=\"login()\">ورود به پنل 🚀</button></div>"
-        + "<p class=\"muted\" style=\"margin-top:16px\">🔒 دسترسی به هیچ بخشی بدون ورود ممکن نیست</p></div></div>"
+        + "</div></div>"
         + "<script>function login(){fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({u:document.getElementById('u').value,p:document.getElementById('p').value})}).then(r=>r.json()).then(d=>{if(d.ok)location.replace('/');else location.replace('/?err='+encodeURIComponent(d.err||'خطا'))}).catch(()=>{location.replace('/?err=خطای اتصال')})}document.addEventListener('keydown',function(e){if(e.key==='Enter')login()});</script>");
 }
 
 function dashPage(user) {
     const isAdmin = user.role === "admin";
     const body =
-        "<div class=\"bar row\"><div><h1>🎮 Steam Idler</h1><p class=\"sub\" style=\"margin-top:2px\">سلام <b style=\"color:#a5b4fc\">" + esc(user.name) + "</b>" + (isAdmin ? " 👑" : "") + " — به پنل خوش اومدی</p></div>"
+        "<div class=\"bar row\"><div><h1>🎮 Steam Idler</h1><p class=\"sub\" style=\"margin-top:2px\">👤 <b style=\"color:#a5b4fc\">" + esc(user.name) + "</b>" + (isAdmin ? " 👑" : "") + "</p></div>"
         + "<div class=\"gline\" style=\"margin:0\"><span class=\"chip ok\" id=\"up\">⏱ ...</span><button class=\"ghost\" onclick=\"logout()\">خروج ⎋</button></div></div>"
-        + "<div class=\"card\"><h2>➕ افزودن اکانت استیم (بدون پسورد، با QR)</h2>"
-        + "<p class=\"sub\">یوزرنیم استیمت رو بنویس و «افزودن» رو بزن — بلافاصله یه QR مخصوص خودت پایین همین کارت اکانتت میاد، با اپ Steam اسکنش کن.</p>"
-        + "<div class=\"gline\" style=\"margin-top:10px\"><input id=\"newacc\" placeholder=\"یوزرنیم استیم...\" style=\"flex:1;min-width:150px\"><button onclick=\"addaccount()\">➕ افزودن اکانت</button></div></div>"
+        + "<div class=\"card\"><div class=\"gline\" style=\"margin:0\"><input id=\"newacc\" placeholder=\"➕ یوزرنیم استیم...\" style=\"flex:1;min-width:150px\"><button onclick=\"addaccount()\">افزودن اکانت</button></div></div>"
         + "<div id=\"accs\"></div>"
         + (isAdmin ? adminHtml() : "")
-        + "<p class=\"muted\" style=\"text-align:center;margin-bottom:20px\">هر ۸ ثانیه به‌روزرسانی خودکار 🔄 — تنظیمات تا Redeploy بعدی حفظ می‌شوند</p>"
         + "<script>var ISADMIN=" + (isAdmin ? "true" : "false") + ";</script>"
         + "<script src=\"/static/panel.js\"></script>";
 
@@ -288,9 +292,8 @@ function dashPage(user) {
 }
 
 function adminHtml() {
-    return "<div class=\"card\"><h2>👥 مدیریت کاربرها (ادمین)</h2>"
-        + "<p class=\"sub\">برای رفیقت یوزر/رمز بساز و بده بهش — خودش وارد می‌شه و اکانتش رو با QR اضافه می‌کنه. (اختیاری: از قبل یه اکانت بهش اختصاص بده)</p>"
-        + "<div class=\"gline\" style=\"margin-top:10px\"><input id=\"nu\" placeholder=\"یوزرنیم\"><input id=\"np\" placeholder=\"رمز عبور\"><select id=\"na\"><option value=\"\">— اکانت (اختیاری) —</option></select><button class=\"warn\" onclick=\"adduser()\">➕ ساخت کاربر</button></div>"
+    return "<div class=\"card\"><h2>👥 کاربرها</h2>"
+        + "<div class=\"gline\" style=\"margin-top:8px\"><input id=\"nu\" placeholder=\"یوزرنیم\"><input id=\"np\" placeholder=\"رمز عبور\"><select id=\"na\"><option value=\"\">— اکانت —</option></select><button class=\"warn\" onclick=\"adduser()\">➕ ساخت</button></div>"
         + "<table id=\"users\" style=\"margin-top:8px\"><tr><th>یوزر</th><th>اکانت‌ها</th><th></th></tr></table></div>";
 }
 
@@ -328,6 +331,7 @@ function stateFor(user) {
             online,
             enabled: s.enabled,
             isFarming: online && b.startedPlayingTimestamp != 0,
+            userPlaying: !!b.userPlayingElsewhere,
             autoRestart: s.autoRestart,
             stopRemain: s.stopAt ? Math.max(0, s.stopAt - now) : 0,
             session: b.startedPlayingTimestamp ? now - b.startedPlayingTimestamp : 0,

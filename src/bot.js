@@ -43,6 +43,10 @@ const Bot = function(logOnOptions, loginindex, proxies) {
     this.startedPlayingTimestamp = 0;
     this.playedAppIDs = [];
 
+    // PANEL: true while the actual user is playing on their own PC (playing session blocked by Steam)
+    this.userPlayingElsewhere = false;
+    this._lastPlayProbe       = 0;
+
     // Create new steam-user bot object. Disable autoRelogin as we have our own queue system
     this.client = new SteamUser({ autoRelogin: false, renewRefreshTokens: true, httpProxy: this.proxy, protocol: SteamUser.EConnectionProtocol.WebSocket }); // Forcing protocol for now: https://dev.doctormckay.com/topic/4187-disconnect-due-to-encryption-error-causes-relog-to-break-error-already-logged-on/?do=findComment&comment=10917
 
@@ -83,6 +87,8 @@ Bot.prototype.login = async function() {
 Bot.prototype.attachEventListeners = function() {
 
     this.client.on("loggedOn", () => { // This account is now logged on
+        this.userPlayingElsewhere = false; // Fresh session = not blocked anymore, panel can resume idling
+
         controller.nextacc++; // The next account can start
 
         // If this is a relog then remove this account from the queue and let the next account be able to relog
@@ -216,12 +222,13 @@ Bot.prototype.attachEventListeners = function() {
 
         } else { // Connection loss
 
-            // RENDER: Another session using this account is online somewhere else (local PC, second Render service...)
-            // Back off hard (10 minutes) instead of ping-pong kicking each other every few seconds!
+            // RENDER: Session got replaced elsewhere (usually: user launched the game/Steam on their own PC).
+            // Mark it, then quietly retry every 3 minutes - after they stop playing, the relog succeeds and idling resumes automatically.
             if (err.eresult == SteamUser.EResult.LoggedInElsewhere) {
-                logger("warn", `[${this.logOnOptions.accountName}] LoggedInElsewhere: This account is logged in somewhere else too (is the idler still running on your PC?). Slowing down relog attempts to every 10 minutes to avoid a login fight...`);
+                logger("warn", `[${this.logOnOptions.accountName}] LoggedInElsewhere: Account is in use on another machine - quietly retrying every 3 minutes (no login fight).`);
 
-                this.handleRelog(600000);
+                this.userPlayingElsewhere = true;
+                this.handleRelog(180000);
                 return;
             }
 
@@ -242,6 +249,26 @@ Bot.prototype.attachEventListeners = function() {
         logger("info", `[${this.logOnOptions.accountName}] SteamUser auto renewed this refresh token, updating database entry...`);
 
         this.session._saveTokenToStorage(newToken);
+    });
+
+    // PANEL: Steam tells us when our playing session gets blocked (user started a game on their own PC) or unblocked again
+    this.client.on("playingState", (blocked, playingApp) => {
+        if (blocked) {
+            if (!this.userPlayingElsewhere) {
+                logger("info", `[${this.logOnOptions.accountName}] Playing session blocked (${playingApp}) - the user is playing on their own PC. Idling is PAUSED and will automatically resume afterwards.`);
+            }
+
+            this.userPlayingElsewhere = true;
+        } else {
+            if (this.userPlayingElsewhere) {
+                logger("info", `[${this.logOnOptions.accountName}] Playing session unblocked - user stopped playing on their PC. Resuming idling...`);
+
+                // Immediately re-claim the games so idling resumes instantly
+                this.client.gamesPlayed(this.playedAppIDs);
+            }
+
+            this.userPlayingElsewhere = false;
+        }
     });
 
 };

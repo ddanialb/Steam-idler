@@ -112,7 +112,7 @@ function adduser() {
     post('/api/admin/user', { u: u, p: p, accounts: a ? [a] : [] }).then(function(d) {
         if (d.err) toast(d.err, false);
         else {
-            toast('✅ کاربر «' + u + '» ساخته شد — یوزر/رمز رو بهش بده تا خودش اکانت استیمش رو با QR اضافه کنه');
+            toast('✅ کاربر «' + u + '» ساخته شد');
             document.getElementById('nu').value = '';
             document.getElementById('np').value = '';
         }
@@ -135,8 +135,9 @@ function addaccount() {
 }
 
 function accCard(a) {
-    var cls = a.online ? (a.isFarming ? 'ok' : 'wait') : 'bad';
-    var st  = a.online ? (a.isFarming ? 'در حال فارم' : 'آنلاین (فارم خاموش)') : (a.enabled ? 'در حال اتصال/آفلاین' : 'خاموش');
+    var userPlaying = !!a.userPlaying;
+    var cls = userPlaying ? 'wait' : (a.online ? (a.isFarming ? 'ok' : 'wait') : 'bad');
+    var st  = userPlaying ? '🖥 داری روی PC بازی می‌کنی' : (a.online ? (a.isFarming ? 'در حال فارم' : 'آنلاین') : (a.enabled ? 'آفلاین' : 'خاموش'));
 
     var h = '<div class="card"><div class="row"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
         + '<b style="font-size:17px">' + esc(a.name) + '</b>'
@@ -145,8 +146,7 @@ function accCard(a) {
         + '</div>';
 
     if (a.waitingQR) {
-        h += '<div class="qrblock"><div class="qrtitle">🔐 QR ورود آماده‌ست!</div>'
-            + '<p class="sub">اپ Steam ← Steam Guard 🛡️ ← اسکنر ← این کد رو اسکن کن</p>'
+        h += '<div class="qrblock"><div class="qrtitle">🔐 با اپ Steam اسکن کن</div>'
             + '<img class="qr" width="230" height="230" alt="QR" src="/api/qr?acc=' + encodeURIComponent(a.nameRaw) + '&t=' + Date.now() + '"></div>';
     }
 
@@ -196,7 +196,7 @@ function render() {
     d.accounts.forEach(function(a) { h += accCard(a); });
 
     if (!d.accounts.length) {
-        h = '<div class="card" style="text-align:center;color:#8ea3c2">از کارت بالا یوزرنیم استیمت رو اضافه کن تا QR ورودت این‌جا بیاد 👆</div>';
+        h = '<div class="card" style="text-align:center;color:#8ea3c2">👆 از بالا یوزرنیم استیم رو اضافه کن</div>';
     }
 
     document.getElementById('accs').innerHTML = h;
