@@ -30,6 +30,16 @@ sessionHandler.prototype._handleCredentialsLoginError = function(err) {
     logger("error", `[${this.logOnOptions.accountName}] Couldn't log in! '${err}' (${err.eresult})`, true);
     logger("debug", err.stack, true);
 
+    // RENDER: expose a friendly message to the control panel so the user actually sees what went wrong
+    if (!global.renderLoginStatus) global.renderLoginStatus = {};
+
+    let friendly = `❌ لاگین نشد (${String(err).slice(0, 60)})`;
+
+    if (err.eresult == EResult.InvalidPassword) friendly = "❌ یوزرنیم یا رمز اشتباهه — بات رو حذف کن و دوباره با اطلاعات درست اضافه کن";
+    if (err.eresult == EResult.RateLimitExceeded || err.eresult == EResult.AccountLoginDeniedThrottle) friendly = "⏳ استیم موقتاً محدود کرد — چند دقیقه صبر کن بعد ری‌استارت بزن";
+
+    global.renderLoginStatus[this.logOnOptions.accountName] = { err: friendly, at: Date.now() };
+
     // Add additional messages for specific errors to hopefully help the user diagnose the cause
     if (err.eresult == EResult.InvalidPassword) logger("", `Note: The error "InvalidPassword" (${err.eresult}) can also be caused by a wrong Username or shared_secret!\n      Try omitting the shared_secret (if you provided one) and check the username & password of '${this.logOnOptions.accountName}' in account.txt!`, true);
 

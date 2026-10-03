@@ -71,6 +71,13 @@ function clearstop(i) {
     act(i, 'autostop', { clear: true }).then(function() { toast('⏱ تایمر حذف شد'); });
 }
 
+function delacc(i) {
+    if (!confirm('این اکانت کامل حذف بشه؟')) return;
+    act(i, 'remove').then(function(d) {
+        toast(d.err || '🗑 اکانت حذف شد', !d.err);
+    });
+}
+
 function restartacc(i) {
     act(i, 'restart').then(function(d) {
         toast(d.err || '🔄 داره ری‌استارت می‌شه...', !d.err);
@@ -158,7 +165,7 @@ function addaccount() {
     if (v.length < 3) { toast('یوزرنیم استیم معتبر نیست', false); return; }
     post('/api/my/addaccount', { steamUser: v, steamPass: pw.value }).then(function(d) {
         if (d.err) toast(d.err, false);
-        else { el.value = ''; pw.value = ''; toast('✅ اکانت اضافه شد'); }
+        else { el.value = ''; pw.value = ''; toast('⏳ دارم لاگین می‌کنم... نتیجه همین‌جا میاد'); }
         load();
     });
 }
@@ -247,7 +254,8 @@ function accCard(a) {
 
     var h = '<div class="card"><div class="row"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
         + '<b style="font-size:17px">' + esc(a.name) + '</b>'
-        + '<span class="chip ' + cls + '"><span class="dot"></span>' + st + '</span></div>'
+        + '<span class="chip ' + cls + '"><span class="dot"></span>' + st + '</span>'
+        + '<button class="ghost" style="padding:6px 10px" title="حذف اکانت" onclick="delacc(' + a.i + ')">🗑</button></div>'
         + (a.session ? '<span class="chip ok">⏱ سشن: ' + fmt(a.session) + '</span>' : '')
         + '</div>';
 
@@ -261,7 +269,11 @@ function accCard(a) {
             + '<div class="gline" style="justify-content:center;margin:10px 0 0"><input id="fa' + a.i + '" maxlength="6" autocomplete="off" placeholder="کد..." style="width:130px;text-align:center;font-size:18px;letter-spacing:4px" onkeydown="if(event.keyCode===13)send2fa(' + a.i + ')"><button onclick="send2fa(' + a.i + ')">تأیید</button></div></div>';
     }
 
-    if (a.enabled && !a.online && !a.waitingQR && !a.needs2FA && !a.userPlaying) {
+    if (a.loginErr && !a.online) {
+        h += '<div style="background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.5);border-radius:10px;padding:10px 12px;margin-top:12px;font-size:13px;color:#fca5a5">' + esc(a.loginErr) + '</div>';
+    }
+
+    if (a.enabled && !a.online && !a.waitingQR && !a.needs2FA && !a.userPlaying && !a.loginErr) {
         h += '<div class="gline" style="margin-top:10px;justify-content:center"><span class="muted"><span class="spin"></span>در حال آماده‌سازی ورود...</span></div>';
     }
 

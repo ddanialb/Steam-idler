@@ -36,6 +36,10 @@ sessionHandler.prototype._attachEvents = function() {
         if (global.renderQrChallenges) delete global.renderQrChallenges[this.logOnOptions.accountName]; // RENDER: clear pending QR from panel
         if (global.render2FAPending) delete global.render2FAPending[this.logOnOptions.accountName];     // RENDER: clear pending guard prompt
 
+        // RENDER: tell the panel why the login is not moving forward (QR/Guard was never approved)
+        if (!global.renderLoginStatus) global.renderLoginStatus = {};
+        global.renderLoginStatus[this.logOnOptions.accountName] = { err: "⏰ تأیید نشد — QR/کد گارد تأیید نشد. ری‌استارت بزن تا دوباره تلاش بشه", at: Date.now() };
+
         logger("warn", `[${this.logOnOptions.accountName}] Login attempt timed out!`);
 
         this._resolvePromise(null);

@@ -89,6 +89,8 @@ Bot.prototype.attachEventListeners = function() {
     this.client.on("loggedOn", () => { // This account is now logged on
         this.userPlayingElsewhere = false; // Fresh session = not blocked anymore, panel can resume idling
 
+        if (global.renderLoginStatus) delete global.renderLoginStatus[this.logOnOptions.accountName]; // Login worked - clear panel error
+
         controller.nextacc++; // The next account can start
 
         // If this is a relog then remove this account from the queue and let the next account be able to relog

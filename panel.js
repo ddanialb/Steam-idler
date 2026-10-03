@@ -454,7 +454,8 @@ function stateFor(user) {
             games: s.games.map(g => ({ appid: g, name: gameNameOf(g) })),
             waitingQR: !!(global.renderQrChallenges && global.renderQrChallenges[name]),
             needs2FA: !!(global.render2FAPending && global.render2FAPending[name]),
-            guardType: (global.render2FAPending && global.render2FAPending[name]) ? global.render2FAPending[name].type : null
+            guardType: (global.render2FAPending && global.render2FAPending[name]) ? global.render2FAPending[name].type : null,
+            loginErr: (global.renderLoginStatus && global.renderLoginStatus[name]) ? global.renderLoginStatus[name].err : null
         };
     });
 
@@ -669,6 +670,27 @@ async function handle(req, res) {
                     b.playedAppIDs = [];
                 }
                 break;
+
+            case "remove": { // Delete this account from the panel entirely
+                try { if (b.client.steamID) b.client.logOff(); } catch (e) { /* ignore */ }
+
+                const qix = controller.relogQueue.indexOf(b.loginindex);
+                if (qix >= 0) controller.relogQueue.splice(qix, 1);
+
+                const bix = controller.allBots.findIndex(x => x.loginindex == b.loginindex);
+                if (bix >= 0) controller.allBots.splice(bix, 1);
+
+                delete state.accounts[name];
+                state.extraAccounts = state.extraAccounts.filter(e => e.name !== name);
+                for (const u of state.users) u.accounts = (u.accounts || []).filter(a => a !== name);
+
+                if (global.renderQrChallenges) delete global.renderQrChallenges[name];
+                if (global.render2FAPending) delete global.render2FAPending[name];
+                if (global.renderLoginStatus) delete global.renderLoginStatus[name];
+
+                saveState();
+                break;
+            }
 
             case "autorestart":
                 s.autoRestart = !!body.on;
