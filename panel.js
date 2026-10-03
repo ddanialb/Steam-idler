@@ -272,7 +272,7 @@ function startWatchdog() {
                 const inRelogQueue   = controller.relogQueue.includes(b.loginindex);
                 const lastTry        = b._panelLastLoginTry || 0;
                 const qrPending      = global.renderQrChallenges && global.renderQrChallenges[name];
-                const cooldown       = b.userPlayingElsewhere ? 180000 : 60000; // fast retry normally, gentler while the user plays on PC
+                const cooldown       = 60000; // retry every minute while offline (covers user-playing-on-PC too)
 
                 if (loginPhaseDone && !inRelogQueue && !qrPending && now - lastTry > cooldown) {
                     b._panelLastLoginTry = now;
@@ -289,9 +289,9 @@ function startWatchdog() {
                         b.startedPlayingTimestamp = now;
                         b.playedAppIDs = s.games.slice();
                     } else {
-                        // Re-assert gamesPlayed to keep the claim alive & resume instantly after the user stops
-                        // playing on their PC. While blocked, probe every 25s for a near-instant resume (~3 min otherwise).
-                        const probeMs = b.userPlayingElsewhere ? 25000 : 180000;
+                        // Re-assert gamesPlayed to keep the claim alive & resume ASAP after the user stops
+                        // playing on their PC. While blocked, probe every 10s for a near-instant resume (~3 min otherwise).
+                        const probeMs = b.userPlayingElsewhere ? 10000 : 180000;
 
                         if (now - (b._lastPlayProbe || 0) > probeMs) {
                             b._lastPlayProbe = now;

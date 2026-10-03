@@ -225,12 +225,12 @@ Bot.prototype.attachEventListeners = function() {
         } else { // Connection loss
 
             // RENDER: Session got replaced elsewhere (usually: user launched the game/Steam on their own PC).
-            // Mark it, then quietly retry every 3 minutes - after they stop playing, the relog succeeds and idling resumes automatically.
+            // Mark it, then quietly retry every minute - right after they stop playing, the relog succeeds and idling resumes.
             if (err.eresult == SteamUser.EResult.LoggedInElsewhere) {
-                logger("warn", `[${this.logOnOptions.accountName}] LoggedInElsewhere: Account is in use on another machine - quietly retrying every 3 minutes (no login fight).`);
+                logger("warn", `[${this.logOnOptions.accountName}] LoggedInElsewhere: Account is in use on another machine - quietly retrying every 60 seconds (no login fight).`);
 
                 this.userPlayingElsewhere = true;
-                this.handleRelog(180000);
+                this.handleRelog(60000);
                 return;
             }
 
