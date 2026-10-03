@@ -71,6 +71,33 @@ function clearstop(i) {
     act(i, 'autostop', { clear: true }).then(function() { toast('⏱ تایمر حذف شد'); });
 }
 
+function restartacc(i) {
+    act(i, 'restart').then(function(d) {
+        toast(d.err || '🔄 داره ری‌استارت می‌شه...', !d.err);
+    });
+}
+
+function gettoken(i) {
+    fetch('/api/acc/' + i + '/token')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d.ok) { toast(d.err || 'توکنی نیست', false); return; }
+            document.getElementById('tok' + i).style.display = 'flex';
+            document.getElementById('tokv' + i).value = d.env;
+        });
+}
+
+function copytok(i) {
+    var v = document.getElementById('tokv' + i);
+    v.select();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(v.value);
+    } else {
+        document.execCommand('copy');
+    }
+    toast('📋 کپی شد! همین رو توی رندر بذار داخل env به اسم REFRESH_TOKENS');
+}
+
 function delgame(i, appid) {
     act(i, 'delgame', { appid: appid });
 }
@@ -168,12 +195,17 @@ function accCard(a) {
     h += '<div class="divider"></div><div class="gline">';
     h += a.isFarming
         ? '<button class="warn" onclick="farm(' + a.i + ',false)">⏸ توقف فارم</button>'
-        : '<button onclick="farm(' + a.i + ',true)">▶ شروع فارم</button>';
+        : '<button class="bfarm" onclick="farm(' + a.i + ',true)">▶ شروع فارم</button>';
     h += a.enabled
-        ? '<button class="danger" onclick="power(' + a.i + ',false)">⏻ خاموش بات</button>'
-        : '<button onclick="power(' + a.i + ',true)">⏻ روشن بات</button>';
+        ? '<button class="danger" onclick="power(' + a.i + ',false)">⏻ خاموش</button>'
+        : '<button class="bfarm" onclick="power(' + a.i + ',true)">⏻ روشن</button>';
+    h += '<button class="brestart" onclick="restartacc(' + a.i + ')">🔄 ری‌استارت</button>';
+    h += '<button class="ghost" onclick="gettoken(' + a.i + ')">🔑 توکن</button>';
     h += '<label class="muted" style="cursor:pointer;display:flex;align-items:center;gap:5px">'
         + '<input type="checkbox" ' + (a.autoRestart ? 'checked' : '') + ' onchange="arestart(' + a.i + ',this.checked)"> ری‌استارت خودکار</label></div>';
+    h += '<div class="tokenbox" id="tok' + a.i + '" style="display:none">'
+        + '<input id="tokv' + a.i + '" readonly value="">'
+        + '<button class="ghost" onclick="copytok(' + a.i + ')">📋 کپی</button></div>';
 
     h += '<div class="gline">⏱ توقف خودکار: '
         + '<input id="sh' + a.i + '" type="number" min="0" style="width:75px" placeholder="ساعت"> ساعت '

@@ -181,26 +181,31 @@ function startWatchdog() {
                 const inRelogQueue   = controller.relogQueue.includes(b.loginindex);
                 const lastTry        = b._panelLastLoginTry || 0;
                 const qrPending      = global.renderQrChallenges && global.renderQrChallenges[name];
-                const cooldown       = b.userPlayingElsewhere ? 300000 : 120000; // gentler while the user plays on their PC
+                const cooldown       = b.userPlayingElsewhere ? 180000 : 60000; // fast retry normally, gentler while the user plays on PC
 
                 if (loginPhaseDone && !inRelogQueue && !qrPending && now - lastTry > cooldown) {
                     b._panelLastLoginTry = now;
                     if (global.logger) logger("info", `[${name}] Panel watchdog: account offline, restarting login...`);
-                    b.login();
+
+                    try { b.login(); } catch (e) { console.log(`[${name}] watchdog login failed: ${e}`); }
                 }
             }
 
-            if (s.enabled && online) { // Farm enforcement + keep-alive probe
+            if (s.enabled && online) { // Farm enforcement + keep-alive/auto-resume probe
                 if (s.farming) {
                     if (b.startedPlayingTimestamp == 0 && !b.userPlayingElsewhere) {
                         b.client.gamesPlayed(s.games);
                         b.startedPlayingTimestamp = now;
                         b.playedAppIDs = s.games.slice();
-                    } else if (now - (b._lastPlayProbe || 0) > 180000) {
-                        // Re-assert our gamesPlayed every 3 min: keeps the session claimed AND auto-resumes idling
-                        // as soon as the user stops playing on their own PC (blocked claims don't disturb their game)
-                        b._lastPlayProbe = now;
-                        b.client.gamesPlayed(s.games);
+                    } else {
+                        // Re-assert gamesPlayed to keep the claim alive & resume instantly after the user stops
+                        // playing on their PC. While blocked, probe every 25s for a near-instant resume (~3 min otherwise).
+                        const probeMs = b.userPlayingElsewhere ? 25000 : 180000;
+
+                        if (now - (b._lastPlayProbe || 0) > probeMs) {
+                            b._lastPlayProbe = now;
+                            b.client.gamesPlayed(s.games);
+                        }
                     }
                 } else if (!s.farming && b.startedPlayingTimestamp != 0) {
                     b.client.gamesPlayed([]);
@@ -227,11 +232,16 @@ const CSS = ""
     + ".sub{color:#8ea3c2;font-size:12px;margin-top:5px;line-height:1.7}"
     + "input,select{background:#0b1526;border:1px solid #2c4066;color:#e2e8f0;border-radius:10px;padding:9px 12px;font-size:14px;font-family:inherit;outline:none;transition:border-color .15s, box-shadow .15s}"
     + "input:focus,select:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.18)}"
-    + "button{border:none;color:#fff;border-radius:10px;padding:9px 16px;font-size:13px;cursor:pointer;font-family:inherit;font-weight:bold;transition:transform .08s,filter .15s;background:linear-gradient(135deg,#3b82f6,#6366f1);box-shadow:0 3px 12px rgba(59,130,246,.35)}"
-    + "button:hover{filter:brightness(1.12)} button:active{transform:scale(.96)}"
-    + "button.warn{background:linear-gradient(135deg,#f59e0b,#f97316);box-shadow:0 3px 12px rgba(245,158,11,.3)}"
-    + "button.danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 3px 12px rgba(239,68,68,.3)}"
+    + "button{border:none;color:#fff;border-radius:12px;padding:10px 18px;font-size:13px;cursor:pointer;font-family:inherit;font-weight:bold;letter-spacing:.2px;transition:transform .12s,filter .15s,box-shadow .15s;background:linear-gradient(135deg,#3b82f6,#6366f1);box-shadow:0 4px 14px rgba(59,130,246,.35)}"
+    + "button:hover{filter:brightness(1.15);transform:translateY(-1px);box-shadow:0 6px 18px rgba(59,130,246,.45)} button:active{transform:scale(.95)}"
+    + "button.warn{background:linear-gradient(135deg,#f59e0b,#f97316);box-shadow:0 4px 14px rgba(245,158,11,.35)}"
+    + "button.danger{background:linear-gradient(135deg,#ef4444,#be123c);box-shadow:0 4px 14px rgba(239,68,68,.35)}"
     + "button.ghost{background:#263855;box-shadow:none}"
+    + "button.bfarm{background:linear-gradient(135deg,#22c55e,#059669);box-shadow:0 4px 14px rgba(34,197,94,.4)}"
+    + "button.brestart{background:linear-gradient(135deg,#8b5cf6,#06b6d4);box-shadow:0 4px 14px rgba(139,92,246,.4)}"
+    + ".tokenbox{display:flex;gap:8px;align-items:center;margin-top:12px;background:#0b1526;border:1px dashed #3b82f6;border-radius:12px;padding:10px}"
+    + ".tokenbox input{flex:1;direction:ltr;font-family:monospace;font-size:11px;background:#060b18;border:1px solid #2c4066;min-width:0}"
+    + ".tokenbox button{padding:8px 12px}"
     + ".chip{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:bold}"
     + ".ok{background:rgba(52,211,153,.14);color:#34d399}.wait{background:rgba(251,191,36,.14);color:#fbbf24}.bad{background:rgba(248,113,113,.14);color:#f87171}"
     + ".dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;animation:p 1.4s infinite}"
@@ -362,6 +372,26 @@ function botByIdx(idx, user) {
     return b;
 }
 
+// Read the current refresh token for an account straight from tokens.db (JSON-lines file, last entry wins)
+function readTokenFromDb(name) {
+    try {
+        const lines = fs.readFileSync("./src/tokens.db", "utf8").split("\n");
+        let tok = null;
+
+        for (const l of lines) {
+            if (!l.trim()) continue;
+            try {
+                const d = JSON.parse(l);
+                if (d.accountName === name && d.token) tok = d.token;
+            } catch (e) { /* skip */ }
+        }
+
+        return tok;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function handle(req, res) {
     const url  = new URL(req.url, "http://x");
     const path = url.pathname;
@@ -406,6 +436,19 @@ async function handle(req, res) {
     }
 
     if (path === "/api/state" && req.method === "GET") return send(res, 200, stateFor(user));
+
+    // Return the account's refresh token ready-to-paste as a REFRESH_TOKENS env value (user:token)
+    const tokM = path.match(/^\/api\/acc\/(\d+)\/token$/);
+    if (tokM && req.method === "GET") {
+        const b = botByIdx(parseInt(tokM[1], 10), user);
+        if (!b) return send(res, 403, { ok: false });
+
+        const name = b.logOnOptions.accountName;
+        const tok  = readTokenFromDb(name);
+
+        if (!tok) return send(res, 404, { ok: false, err: "هنوز توکنی ذخیره نشده — اول یه بار لاگین کن (QR یا env)" });
+        return send(res, 200, { ok: true, env: name + ":" + tok });
+    }
 
     if (path === "/api/search" && req.method === "GET") {
         const q = (url.searchParams.get("q") || "").trim();
@@ -498,6 +541,21 @@ async function handle(req, res) {
 
             case "autorestart":
                 s.autoRestart = !!body.on;
+                break;
+
+            case "restart": // Hard restart: force fresh login (drops any stale/blocked session state)
+                s.enabled = true;
+                b.userPlayingElsewhere = false;
+                b._panelLastLoginTry = 0;
+
+                try { if (b.client.steamID) b.client.logOff(); } catch (e) { /* ignore */ }
+
+                b.startedPlayingTimestamp = 0;
+                b.playedAppIDs = [];
+
+                setTimeout(() => {
+                    try { b.login(); } catch (e) { console.log(`[${name}] manual restart failed: ${e}`); }
+                }, 3000);
                 break;
 
             case "autostop":
