@@ -13,6 +13,7 @@ const http   = require("http");
 const fs     = require("fs");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+const SteamSession = require("steam-session");
 
 let controller = null;
 let config     = null;
@@ -124,6 +125,96 @@ function createDynamicBot(accountName, password) {
     bot.login();
     console.log(`[panel] User-added account '${accountName}' - login started (${password ? "credentials" : "QR"})`);
     return bot;
+}
+
+/* ---------------- One-click Steam QR Login ---------------- */
+// No username typing: you just scan the QR, Steam itself tells us which account you are.
+
+const qrLogins = new Map(); // id -> { session, img, owner, createdAt, done, account }
+
+// Seed a refresh token so the bot logs straight in. Uses the bot's live nedb instance when it exists
+// (its in-memory cache is authoritative), otherwise writes to the file before the bot is created.
+async function seedTokenFor(accountName, token) {
+    const b = allBotsSafe().find(x => x.logOnOptions.accountName.toLowerCase() === accountName.toLowerCase());
+
+    if (b && b.session && b.session.tokensdb) {
+        await b.session.tokensdb.updateAsync({ accountName }, { $set: { token } }, { upsert: true });
+    } else {
+        const nedb = require("@seald-io/nedb");
+        const db = new nedb({ filename: "./src/tokens.db" });
+        await db.loadDatabaseAsync();
+        await db.updateAsync({ accountName }, { $set: { token } }, { upsert: true });
+        await db.persistence.compactDatafileAsync();
+    }
+}
+
+function wireQrSession(id) {
+    const entry = qrLogins.get(id);
+    if (!entry) return;
+
+    try { entry.session.cancelLoginAttempt(); } catch (e) { /* ignore */ }
+
+    const session = new SteamSession.LoginSession(SteamSession.EAuthTokenPlatformType.SteamClient);
+    entry.session = session;
+    entry.img = null;
+
+    session.startWithQR()
+        .then(async (res) => {
+            try {
+                entry.img = await QRCode.toDataURL(res.qrChallengeUrl, { scale: 9, margin: 2, color: { dark: "#0b1526", light: "#ffffff" } });
+            } catch (e) { /* ignore */ }
+        })
+        .catch(() => { entry.img = null; });
+
+    session.on("authenticated", async () => {
+        try {
+            const accountName = session.accountName;
+            const token       = session.refreshToken;
+
+            await seedTokenFor(accountName, token); // First seed so the bot connects instantly
+
+            entry.done    = true;
+            entry.account = accountName;
+
+            const existing = allBotsSafe().find(b => b.logOnOptions.accountName.toLowerCase() === accountName.toLowerCase());
+
+            if (existing) { // Known account just resurfaced - hard restart it so it picks the new token up
+                existing._panelLastLoginTry = 0;
+                existing.userPlayingElsewhere = false;
+                try { if (existing.client.steamID) existing.client.logOff(); } catch (e) { /* ignore */ }
+                setTimeout(() => { try { existing.login(); } catch (e) { /* ignore */ } }, 2000);
+            } else { // Brand new account
+                createDynamicBot(accountName);
+
+                if (!state.extraAccounts.some(e => e.name == accountName)) state.extraAccounts.push({ name: accountName, owner: entry.owner });
+
+                const ownerUser = state.users.find(u => u.name === entry.owner);
+                if (ownerUser && !ownerUser.accounts.includes(accountName)) ownerUser.accounts.push(accountName);
+            }
+
+            saveState();
+            if (global.logger) logger("info", `[${accountName}] One-click QR login approved - account is live now.`);
+        } catch (e) {
+            console.log("qrlogin authenticated failed: " + e);
+        }
+
+        try { session.cancelLoginAttempt(); } catch (e) { /* ignore */ }
+    });
+
+    session.on("timeout", () => { // QR expired before being scanned -> instantly mint a fresh one (keeps rotating forever)
+        if (qrLogins.has(id) && !entry.done) wireQrSession(id);
+    });
+
+    session.on("error", () => {
+        if (qrLogins.has(id) && !entry.done) setTimeout(() => wireQrSession(id), 5000);
+    });
+}
+
+function startQrLogin(owner) {
+    const id = crypto.randomBytes(8).toString("hex");
+    qrLogins.set(id, { session: null, img: null, owner, createdAt: Date.now(), done: false, account: null });
+    wireQrSession(id);
+    return id;
 }
 
 const searchCache = new Map();
@@ -272,6 +363,7 @@ const CSS = ""
     + ".switch input:checked + .sw:before{transform:translateX(-19px);background:#22c55e}"
     + ".spin{display:inline-block;width:16px;height:16px;border:2px solid #2c4066;border-top-color:#7dd3fc;border-radius:50%;animation:rot 1s linear infinite;vertical-align:-3px;margin-left:6px}"
     + "@keyframes rot{to{transform:rotate(360deg)}}"
+    + ".modal{position:fixed;inset:0;background:rgba(3,7,17,.75);display:none;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(5px)}"
     + ".bigbtn{width:100%;padding:12px;font-size:15px;margin-top:6px}"
     ;
 
@@ -300,9 +392,15 @@ function dashPage(user) {
     const body =
         "<div class=\"bar row\"><div><h1>🎮 Steam Idler</h1><p class=\"sub\" style=\"margin-top:2px\">👤 <b style=\"color:#a5b4fc\">" + esc(user.name) + "</b>" + (isAdmin ? " 👑" : "") + "</p></div>"
         + "<div class=\"gline\" style=\"margin:0\"><span class=\"chip ok\" id=\"up\">⏱ ...</span><button class=\"ghost\" onclick=\"logout()\">خروج ⎋</button></div></div>"
-        + "<div class=\"card\"><div class=\"gline\" style=\"margin:0\"><input id=\"newacc\" placeholder=\"➕ یوزرنیم استیم...\" style=\"flex:1;min-width:130px\"><input id=\"newpass\" type=\"password\" placeholder=\"رمز (خالی = با QR)\" style=\"flex:1;min-width:130px\" autocomplete=\"off\"><button onclick=\"addaccount()\">افزودن</button></div></div>"
+        + "<div class=\"card\"><div class=\"gline\" style=\"margin:0\"><input id=\"newacc\" placeholder=\"➕ یوزرنیم استیم...\" style=\"flex:1;min-width:130px\"><input id=\"newpass\" type=\"password\" placeholder=\"رمز (خالی = با QR)\" style=\"flex:1;min-width:130px\" autocomplete=\"off\"><button onclick=\"addaccount()\">افزودن</button><button class=\"brestart\" onclick=\"openQrLogin()\">⚡ ورود با QR</button></div></div>"
         + "<div id=\"accs\"></div>"
         + (isAdmin ? adminHtml() : "")
+        + "<div class=\"modal\" id=\"qrmodal\" onclick=\"if(event.target===this)closeQrLogin()\"><div class=\"card\" style=\"max-width:340px;text-align:center\">"
+        + "<h2 style=\"margin-bottom:4px\">📱 ورود با QR</h2>"
+        + "<div id=\"qrspin\" style=\"padding:40px 0\"><span class=\"spin\" style=\"width:26px;height:26px\"></span></div>"
+        + "<img id=\"qrimg\" class=\"qr\" width=\"240\" height=\"240\" style=\"display:none\" alt=\"QR\">"
+        + "<div class=\"gline\" style=\"justify-content:center;margin-top:12px\"><button class=\"ghost\" onclick=\"closeQrLogin()\">بستن</button></div>"
+        + "</div></div>"
         + "<script>var ISADMIN=" + (isAdmin ? "true" : "false") + ";</script>"
         + "<script src=\"/static/panel.js\"></script>";
 
@@ -482,6 +580,28 @@ async function handle(req, res) {
             res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "no-store" });
             return res.end(buf);
         } catch (e) { return send(res, 500, { ok: false, err: String(e) }); }
+    }
+
+    if (path === "/api/qrlogin/start" && req.method === "POST") {
+        return send(res, 200, { id: startQrLogin(user.name) });
+    }
+
+    const qlM = path.match(/^\/api\/qrlogin\/([a-f0-9]{16})$/);
+    if (qlM && req.method === "GET") {
+        const e = qrLogins.get(qlM[1]);
+        if (!e || (e.owner !== user.name && user.role !== "admin")) return send(res, 200, { status: "gone" });
+        if (e.done) {
+            const acc = e.account;
+            qrLogins.delete(qlM[1]);
+            return send(res, 200, { status: "done", account: acc });
+        }
+        return send(res, 200, { status: "pending", img: e.img });
+    }
+    if (qlM && req.method === "POST") { // cancel/close
+        const e = qrLogins.get(qlM[1]);
+        if (e) { try { e.session.cancelLoginAttempt(); } catch (err) { /* ignore */ } }
+        qrLogins.delete(qlM[1]);
+        return send(res, 200, { ok: true });
     }
 
     // Any logged-in user can add their OWN steam account (QR login only)
@@ -680,6 +800,16 @@ function attach(ctrl, cfg) {
             try { send(res, 500, { ok: false, err: "server error" }); } catch (e) { /* ignore */ }
         });
     }).listen(PORT, () => console.log(`Panel listening on port ${PORT}`));
+
+    // Abandoned QR logins older than 10 minutes get cleaned up
+    setInterval(() => {
+        for (const [id, e] of qrLogins) {
+            if (Date.now() - e.createdAt > 600000 && !e.done) {
+                try { e.session.cancelLoginAttempt(); } catch (err) { /* ignore */ }
+                qrLogins.delete(id);
+            }
+        }
+    }, 60000);
 
     startWatchdog();
 }

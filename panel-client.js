@@ -172,6 +172,64 @@ function qrretry(t) {
     }, 3000);
 }
 
+var QRID = null;
+var QRT = null;
+
+function openQrLogin() {
+    post('/api/qrlogin/start', {}).then(function(d) {
+        if (!d.id) { toast('خطا در ساخت QR', false); return; }
+
+        QRID = d.id;
+        var m = document.getElementById('qrmodal');
+        document.getElementById('qrimg').style.display = 'none';
+        document.getElementById('qrspin').style.display = 'block';
+        m.style.display = 'flex';
+
+        qrpoll();
+        clearInterval(QRT);
+        QRT = setInterval(qrpoll, 4000);
+    });
+}
+
+function qrpoll() {
+    if (!QRID) return;
+
+    fetch('/api/qrlogin/' + QRID)
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.status === 'done') {
+                closeQrLogin(true);
+                toast('✅ ورود انجام شد: ' + d.account);
+                load();
+                return;
+            }
+
+            if (d.status === 'gone') { closeQrLogin(true); return; }
+
+            if (d.img) {
+                var im = document.getElementById('qrimg');
+                if (im.getAttribute('src') !== d.img) im.setAttribute('src', d.img);
+                im.style.display = 'block';
+                document.getElementById('qrspin').style.display = 'none';
+            }
+        })
+        .catch(function() {});
+}
+
+function closeQrLogin(keepQuiet) {
+    if (QRT) { clearInterval(QRT); QRT = null; }
+    if (QRID && !keepQuiet) {
+        var id = QRID;
+        QRID = null;
+        fetch('/api/qrlogin/' + id, { method: 'POST' }).catch(function() {});
+    } else {
+        QRID = null;
+    }
+
+    var m = document.getElementById('qrmodal');
+    if (m) m.style.display = 'none';
+}
+
 function send2fa(i) {
     var el = document.getElementById('fa' + i);
     var code = el.value.trim();
